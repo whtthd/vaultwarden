@@ -4,6 +4,15 @@ target
 # Data folder
 data
 
+# Local production database exports
+db_backup/
+
+# Local walkthrough notes
+/docs/UX_REVIEW.md
+
+# macOS folder metadata
+.DS_Store
+
 # IDE files
 .vscode
 .idea

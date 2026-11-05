@@ -54,6 +54,20 @@ pub struct CollectionCipher {
 
 /// Local methods
 impl Collection {
+    pub fn item_access_external_id(cipher_id: &CipherId) -> String {
+        format!("vaultwarden:item-access:{cipher_id}")
+    }
+
+    pub fn is_item_access(&self) -> bool {
+        self.external_id.as_deref().is_some_and(|id| id.starts_with("vaultwarden:item-access:"))
+    }
+
+    pub fn accepts_cipher(&self, cipher_id: &CipherId) -> bool {
+        !self.is_item_access()
+            || (self.uuid.as_ref() == cipher_id.as_ref()
+                && self.external_id.as_deref() == Some(Self::item_access_external_id(cipher_id).as_str()))
+    }
+
     pub fn new(org_uuid: OrganizationId, name: String, external_id: Option<String>) -> Self {
         let mut new_model = Self {
             uuid: CollectionId(crate::util::get_uuid()),
@@ -890,6 +904,11 @@ impl CollectionUser {
 /// Database methods
 impl CollectionCipher {
     pub async fn save(cipher_uuid: &CipherId, collection_uuid: &CollectionId, conn: &DbConn) -> EmptyResult {
+        if let Some(collection) = Collection::find_by_uuid(collection_uuid, conn).await
+            && !collection.accepts_cipher(cipher_uuid)
+        {
+            err!("A single-item access collection cannot contain another item");
+        }
         Self::update_users_revision(collection_uuid, conn).await;
 
         db_run! { conn:

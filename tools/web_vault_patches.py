@@ -1,0 +1,100 @@
+"""Exact, reviewable hooks for the upstream 2026.10.1 web-vault bundle."""
+
+ORIGINAL_ASSET = "app/main.1176a28a68b7b4809391.js"
+ORIGINAL_SHA256 = "5defb27621655bc05a54d042e32ce21d66dadd337b3bc60bc0cb49c234e441d1"
+LOCAL_ORIGIN = (
+    '(window.location.protocol==="https:"&&window.location.port==="8001"&&'
+    '["127.0.0.1","localhost","[::1]"].includes(window.location.hostname))'
+)
+LOCAL_PATCHES = [
+    (
+        'case b.Lw.Never:return this.platformUtilsService.isDev();default:',
+        'case b.Lw.Never:return this.platformUtilsService.isDev()||' + LOCAL_ORIGIN + ';default:',
+    ),
+    (
+        'provide:Ue.G$,useClass:wa.g2,deps:[]',
+        'provide:Ue.G$,useClass:' + LOCAL_ORIGIN + '?Fb:wa.g2,deps:[]',
+    ),
+]
+ENHANCEMENT_PATCHES = [
+    (
+        'collectionQueryParams(e){const t=null!=e?e:null;return this.enabled()?'
+        '{sharedFolderId:t,collectionId:null}:{collectionId:t,sharedFolderId:null}}',
+        'collectionQueryParams(e){const t=null!=e?e:null;return this.enabled()?'
+        '{sharedFolderId:t,collectionId:null,search:null}:{collectionId:t,sharedFolderId:null,search:null}}',
+    ),
+    (
+        'this.previousRef=this.service.scrollableRef(),this.service.scrollableRef.set(this.ref)',
+        'this.previousRef=this.service.scrollableRef(),this.service.scrollableRef.set(this.ref),'
+        'window.VaultwardenEnhancements.registerScrollHost(this)',
+    ),
+    (
+        'ngOnDestroy(){this.service.scrollableRef()===this.ref&&this.service.scrollableRef.set(this.previousRef)}',
+        'ngOnDestroy(){window.VaultwardenEnhancements.unregisterScrollHost(this),'
+        'this.service.scrollableRef()===this.ref&&this.service.scrollableRef.set(this.previousRef)}',
+    ),
+    (
+        'static nestedTraverse(e,t,i,s,o,a){if(i.length<=t)return;',
+        'static nestedTraverse(e,t,i,s,o,a){if(s.organizationId)return '
+        'window.VaultwardenEnhancements.nestedCollectionTraverse(e,t,i,s,o,a,(e,t,i)=>new n.n(e,t,i));'
+        'if(i.length<=t)return;',
+    ),
+    (
+        'this.params.showOrgSelector&&this.showOrgSelector.set(!0),'
+        'this.formGroup.patchValue({selectedOrg:this.params.organizationId},{emitEvent:!1}),this.organizationSelected',
+        'this.params.showOrgSelector&&this.showOrgSelector.set(!0),'
+        'this.formGroup.patchValue({selectedOrg:this.params.organizationId},{emitEvent:!1}),'
+        'window.VaultwardenEnhancements.registerCollectionDialog(this),this.organizationSelected',
+    ),
+    (
+        'this.collectionAdminService.update(c,u)',
+        'window.VaultwardenEnhancements.saveCollection(this,c,u,v._)',
+    ),
+    (
+        'this.collectionAdminService.create(c,u)',
+        'window.VaultwardenEnhancements.createCollection(this,c,u,v._)',
+    ),
+    (
+        '93817(e,t,i){"use strict";i.d(t,{l:()=>qe});var n=i(15639)',
+        '93817(e,t,i){"use strict";i.d(t,{l:()=>qe});var vwCollectionAdmin=i(21571).vE,n=i(15639)',
+    ),
+    (
+        'this.permissionPriority=[y.aF.Manage,y.aF.Edit,y.aF.EditExceptPass,y.aF.View,y.aF.ViewExceptPass]}',
+        'this.permissionPriority=[y.aF.Manage,y.aF.Edit,y.aF.EditExceptPass,y.aF.View,y.aF.ViewExceptPass],'
+        'this.vwCollectionAdminService=(0,p.WQX)(vwCollectionAdmin)}',
+    ),
+    (
+        'ngOnInit(){return K(this,void 0,void 0,function*(){null!=this.cipher.organizationId&&'
+        '(this.organization=this.organizations.find(e=>e.id===this.cipher.organizationId))})}get showArchiveButton()',
+        'ngOnInit(){return K(this,void 0,void 0,function*(){null!=this.cipher.organizationId&&'
+        '(this.organization=this.organizations.find(e=>e.id===this.cipher.organizationId)),'
+        'window.VaultwardenEnhancements.registerCipherRow(this,A._)})}'
+        'ngOnDestroy(){window.VaultwardenEnhancements.unregisterCipherRow(this)}get showArchiveButton()',
+    ),
+    (
+        'this.originalCipherView=yield this.addEditFormService.decryptCipher(this.config.originalCipher)',
+        '"clone"===this.config.mode&&(this.config.originalCipher='
+        'window.VaultwardenEnhancements.cloneSourceWithoutItemAccess(this.config.originalCipher)),'
+        'this.originalCipherView=yield this.addEditFormService.decryptCipher(this.config.originalCipher)',
+    ),
+    (
+        '"AllCollections"!==this.activeFilter.collectionId&&null!=this.activeFilter.collectionId?'
+        'this.activeFilter.collectionId:null',
+        '"AllCollections"!==this.activeFilter.collectionId&&null!=this.activeFilter.collectionId&&'
+        '!this.activeFilter.collectionId.startsWith("vw-ancestor:")?this.activeFilter.collectionId:null',
+    ),
+    (
+        '.subscribe(e=>this.router.navigate([],{queryParams:{search:Ui.A.isNullOrEmpty(e)?null:e}',
+        '.subscribe(e=>window.VaultwardenEnhancements.searchMatchesInput(e)&&'
+        'this.router.navigate([],{queryParams:{search:Ui.A.isNullOrEmpty(e)?null:e}',
+    ),
+]
+
+
+def patch_bundle(original, local_dev=False):
+    patched = original
+    for before, after in ENHANCEMENT_PATCHES + (LOCAL_PATCHES if local_dev else []):
+        if patched.count(before.encode()) != 1:
+            raise ValueError("Expected one supported web-vault hook: " + before[:60])
+        patched = patched.replace(before.encode(), after.encode(), 1)
+    return patched

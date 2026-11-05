@@ -15,10 +15,11 @@ use crate::{
     db::{
         DbConn,
         models::{
-            Cipher, CipherId, Collection, CollectionCipher, CollectionGroup, CollectionId, CollectionUser,
-            CustomPermission, Device, EventType, FillAssistPolicyData, Group, GroupId, GroupUser, Invitation,
-            Membership, MembershipId, MembershipStatus, MembershipType, OrgPolicy, OrgPolicyType, Organization,
-            OrganizationApiKey, OrganizationId, TwoFactor, TwoFactorType, User, UserId, custom_roles_enabled,
+            Cipher, CipherId, Collection, CollectionCipher, CollectionGroup, CollectionId, CollectionUpdate,
+            CollectionUser, CustomPermission, Device, EventType, FillAssistPolicyData, Group, GroupId, GroupUser,
+            Invitation, Membership, MembershipId, MembershipStatus, MembershipType, OrgPolicy, OrgPolicyType,
+            Organization, OrganizationApiKey, OrganizationId, TwoFactor, TwoFactorType, User, UserId,
+            custom_roles_enabled,
         },
     },
     mail,
@@ -42,6 +43,9 @@ pub fn routes() -> Vec<Route> {
         put_organization,
         post_organization_collections,
         post_bulk_access_collections,
+        post_bulk_update_collections,
+        get_item_access,
+        put_item_access,
         put_organization_collection_update,
         delete_organization_collection,
         bulk_delete_organization_collections,
@@ -163,6 +167,282 @@ struct CollectionMembershipData {
     id: MembershipId,
     read_only: bool,
     manage: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CollectionUpdateData {
+    id: CollectionId,
+    name: Option<String>,
+    external_id: Option<String>,
+    users: Option<Vec<CollectionMembershipData>>,
+    groups: Option<Vec<CollectionGroupData>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BulkCollectionUpdateData {
+    collections: Vec<CollectionUpdateData>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ItemAccessData {
+    name: String,
+    users: Vec<CollectionMembershipData>,
+}
+
+async fn item_access_cipher(
+    org_id: &OrganizationId,
+    cipher_id: &CipherId,
+    conn: &DbConn,
+) -> Result<Cipher, crate::error::Error> {
+    let Some(cipher) = Cipher::find_by_uuid(cipher_id, conn).await else {
+        err!("Login not found");
+    };
+    if cipher.organization_uuid.as_ref() != Some(org_id) || cipher.atype != 1 || cipher.deleted_at.is_some() {
+        err!("Login not found");
+    }
+    Ok(cipher)
+}
+
+async fn item_access_response(
+    org_id: &OrganizationId,
+    cipher_id: &CipherId,
+    user_id: &UserId,
+    conn: &DbConn,
+) -> JsonResult {
+    let collection_id = CollectionId::from(cipher_id.to_string());
+    let collection = Collection::find_by_uuid(&collection_id, conn).await;
+    let mut assignees = Vec::new();
+    let response = if let Some(collection) = collection {
+        if collection.org_uuid != *org_id || !collection.is_item_access() || !collection.accepts_cipher(cipher_id) {
+            err!("The reserved single-item access collection is unavailable");
+        }
+        for grant in CollectionUser::find_by_organization_swap_user_uuid_with_member_uuid(org_id, conn).await {
+            if grant.collection_uuid == collection_id {
+                assignees.push(grant.to_json_details_for_member(MembershipType::User as i32));
+            }
+        }
+        let mut response = collection.to_json_details(user_id, None, conn).await;
+        response["assigned"] = json!(true);
+        response
+    } else {
+        Value::Null
+    };
+    let mut members = Vec::new();
+    for member in Membership::find_by_org(org_id, conn).await {
+        let mut detail = member.to_json_mini_details(conn).await;
+        detail["fullAccess"] = json!(member.has_full_access());
+        members.push(detail);
+    }
+    let cipher = item_access_cipher(org_id, cipher_id, conn).await?;
+    Ok(Json(json!({ "collection": response, "users": assignees, "members": members,
+        "revisionDate": crate::util::format_date(&cipher.updated_at) })))
+}
+
+#[get("/organizations/<org_id>/ciphers/<cipher_id>/item-access")]
+async fn get_item_access(
+    org_id: OrganizationId,
+    cipher_id: CipherId,
+    headers: AdminHeaders,
+    conn: DbConn,
+) -> JsonResult {
+    if org_id != headers.org_id {
+        err!("Organization not found");
+    }
+    item_access_cipher(&org_id, &cipher_id, &conn).await?;
+    item_access_response(&org_id, &cipher_id, &headers.user.uuid, &conn).await
+}
+
+#[put("/organizations/<org_id>/ciphers/<cipher_id>/item-access", data = "<data>")]
+async fn put_item_access(
+    org_id: OrganizationId,
+    cipher_id: CipherId,
+    headers: AdminHeaders,
+    data: Json<ItemAccessData>,
+    conn: DbConn,
+    nt: Notify<'_>,
+) -> JsonResult {
+    if org_id != headers.org_id {
+        err!("Organization not found");
+    }
+    item_access_cipher(&org_id, &cipher_id, &conn).await?;
+    let data = data.into_inner();
+    if data.name.is_empty() {
+        err!("An encrypted access collection name is required");
+    }
+    let collection_id = CollectionId::from(cipher_id.to_string());
+    let mut users = Vec::with_capacity(data.users.len());
+    let mut seen = HashSet::new();
+    for grant in data.users {
+        if grant.manage || !seen.insert(grant.id.clone()) {
+            err!("Invalid single-item access grant");
+        }
+        let Some(member) = Membership::find_by_uuid_and_org(&grant.id, &org_id, &conn).await else {
+            err!("User is not part of organization");
+        };
+        if member.status != MembershipStatus::Confirmed as i32 {
+            err!("Only confirmed members can be granted access");
+        }
+        if member.has_full_access() {
+            continue;
+        }
+        users.push(CollectionUser {
+            user_uuid: member.user_uuid,
+            collection_uuid: collection_id.clone(),
+            read_only: grant.read_only,
+            hide_passwords: grant.hide_passwords,
+            manage: false,
+        });
+    }
+    CollectionUpdate::save_item_access(org_id.clone(), cipher_id.clone(), data.name, users, &conn).await?;
+    log_event(
+        EventType::CollectionUpdated,
+        &collection_id,
+        &org_id,
+        &headers.user.uuid,
+        headers.device.atype,
+        &headers.ip.ip,
+        &conn,
+    )
+    .await;
+    for member in Membership::find_by_org(&org_id, &conn).await {
+        if let Some(user) = User::find_by_uuid(&member.user_uuid, &conn).await {
+            nt.send_user_update(UpdateType::SyncVault, &user, headers.device.push_uuid.as_ref(), &conn).await;
+        }
+    }
+    item_access_response(&org_id, &cipher_id, &headers.user.uuid, &conn).await
+}
+
+#[post("/organizations/<org_id>/collections/bulk-update", data = "<data>")]
+async fn post_bulk_update_collections(
+    org_id: OrganizationId,
+    headers: ManagerHeadersLoose,
+    data: Json<BulkCollectionUpdateData>,
+    conn: DbConn,
+    nt: Notify<'_>,
+) -> JsonResult {
+    if org_id != headers.membership.org_uuid {
+        err!("Organization not found");
+    }
+    let data = data.into_inner();
+    if data.collections.is_empty() {
+        err!("No collections selected");
+    }
+    let ids: Vec<_> = data.collections.iter().map(|c| c.id.clone()).collect();
+    if ids.iter().collect::<HashSet<_>>().len() != ids.len() {
+        err!("Duplicate collection");
+    }
+    let headers = ManagerHeaders::from_loose(headers, &ids, &conn).await?;
+    let members = Membership::find_by_org(&org_id, &conn).await;
+    let members: HashMap<_, _> = members.iter().map(|m| (&m.uuid, m)).collect();
+    let groups = Group::find_by_organization(&org_id, &conn).await;
+    let groups: HashSet<_> = groups.iter().map(|g| &g.uuid).collect();
+    let mut updates = Vec::with_capacity(ids.len());
+    for change in data.collections {
+        let Some(mut collection) = Collection::find_by_uuid_and_org(&change.id, &org_id, &conn).await else {
+            err!("Collection not found");
+        };
+        if collection.is_item_access() {
+            err!("Use the login's single-item permissions to update this collection");
+        }
+        if change.external_id.as_deref().is_some_and(|id| id.starts_with("vaultwarden:item-access:")) {
+            err!("This external identifier is reserved for single-item access");
+        }
+        if let Some(name) = change.name {
+            if name.is_empty() {
+                err!("Collection name is required");
+            }
+            collection.name = name;
+        }
+        collection.set_external_id(change.external_id);
+        let users_access = if let Some(users) = change.users {
+            let mut seen = HashSet::new();
+            let mut access = Vec::with_capacity(users.len());
+            for user in users {
+                let Some(member) = members.get(&user.id) else {
+                    err!("User is not part of organization");
+                };
+                if !seen.insert(user.id) {
+                    err!("Duplicate member");
+                }
+                if !member.access_all {
+                    access.push(CollectionUser {
+                        user_uuid: member.user_uuid.clone(),
+                        collection_uuid: collection.uuid.clone(),
+                        read_only: user.read_only,
+                        hide_passwords: user.hide_passwords,
+                        manage: user.manage,
+                    });
+                }
+            }
+            Some(access)
+        } else {
+            None
+        };
+        let groups_access = if let Some(group_changes) = change.groups {
+            let mut seen = HashSet::new();
+            let mut access = Vec::with_capacity(group_changes.len());
+            for group in group_changes {
+                if !groups.contains(&group.id) {
+                    err!("Group is not part of organization");
+                }
+                if !seen.insert(group.id.clone()) {
+                    err!("Duplicate group");
+                }
+                access.push(CollectionGroup::new(
+                    collection.uuid.clone(),
+                    group.id,
+                    group.read_only,
+                    group.hide_passwords,
+                    group.manage,
+                ));
+            }
+            Some(access)
+        } else {
+            None
+        };
+        updates.push(CollectionUpdate {
+            collection,
+            users: users_access,
+            groups: groups_access,
+        });
+    }
+    CollectionUpdate::save_all(org_id.clone(), updates, &conn).await?;
+
+    let member = Membership::find_by_user_and_org(&headers.user.uuid, &org_id, &conn).await;
+    let mut responses = Vec::with_capacity(ids.len());
+    for id in ids {
+        log_event(
+            EventType::CollectionUpdated,
+            &id,
+            &org_id,
+            &headers.user.uuid,
+            headers.device.atype,
+            &headers.ip.ip,
+            &conn,
+        )
+        .await;
+        let Some(collection) = Collection::find_by_uuid_and_org(&id, &org_id, &conn).await else {
+            err!("Collection not found after update");
+        };
+        let assigned = if let Some(member) = &member {
+            Collection::can_access_collection(member, &id, &conn).await
+        } else {
+            false
+        };
+        let mut response = collection.to_json_details(&headers.user.uuid, None, &conn).await;
+        response["assigned"] = json!(assigned);
+        responses.push(response);
+    }
+    // Notify removed assignees too, so an open vault drops revoked access.
+    for member in Membership::find_by_org(&org_id, &conn).await {
+        if let Some(user) = User::find_by_uuid(&member.user_uuid, &conn).await {
+            nt.send_user_update(UpdateType::SyncVault, &user, headers.device.push_uuid.as_ref(), &conn).await;
+        }
+    }
+    Ok(Json(json!({ "object": "list", "data": responses, "continuationToken": null })))
 }
 
 #[derive(Deserialize)]
@@ -480,6 +760,10 @@ async fn post_organization_collections(
     let data: FullCollectionData = data.into_inner();
     data.validate(&org_id, &conn).await?;
 
+    if data.external_id.as_deref().is_some_and(|id| id.starts_with("vaultwarden:item-access:")) {
+        err!("This external identifier is reserved for single-item access");
+    }
+
     if headers.membership.atype == MembershipType::Manager && !headers.membership.access_all {
         err!("You don't have permission to create collections")
     }
@@ -546,6 +830,12 @@ async fn post_bulk_access_collections(
         err!("Organization not found", "Organization id's do not match");
     }
     let data: BulkCollectionAccessData = data.into_inner();
+
+    for id in &data.collection_ids {
+        if Collection::find_by_uuid_and_org(id, &org_id, &conn).await.is_some_and(|c| c.is_item_access()) {
+            err!("Use the login's single-item permissions to update this collection");
+        }
+    }
 
     if Organization::find_by_uuid(&org_id, &conn).await.is_none() {
         err!("Can't find organization details")
@@ -627,6 +917,12 @@ async fn put_organization_collection_update(
     let Some(mut collection) = Collection::find_by_uuid_and_org(&col_id, &org_id, &conn).await else {
         err!("Collection not found")
     };
+    if collection.is_item_access() {
+        err!("Use the login's single-item permissions to update this collection");
+    }
+    if data.external_id.as_deref().is_some_and(|id| id.starts_with("vaultwarden:item-access:")) {
+        err!("This external identifier is reserved for single-item access");
+    }
 
     collection.name = data.name;
     collection.external_id = match data.external_id {
@@ -1826,6 +2122,13 @@ async fn post_org_import(
 
     let existing_collections: HashMap<CollectionId, Collection> =
         Collection::find_by_organization(&org_id, &conn).await.into_iter().map(|c| (c.uuid.clone(), c)).collect();
+    // Reserved single-item collections are maintained by the item-access API. Rejecting
+    // them before creating anything keeps an import from partially changing that access.
+    for col in &data.collections {
+        if col.id.as_ref().and_then(|id| existing_collections.get(id)).is_some_and(Collection::is_item_access) {
+            err!("Single-item access collections cannot be imported");
+        }
+    }
     let mut collections: Vec<CollectionId> = Vec::with_capacity(data.collections.len());
     for col in data.collections {
         let existing = col.id.as_ref().and_then(|col_id| existing_collections.get(col_id));
@@ -1843,7 +2146,10 @@ async fn post_org_import(
             if headers.membership.atype <= MembershipType::Manager && !headers.membership.has_full_access() {
                 err!(Compact, "The current user isn't allowed to create new collections")
             }
-            let new_collection = Collection::new(org_id.clone(), col.name, col.external_id);
+            // A reserved marker copied from an export must not turn an ordinary
+            // imported collection into a single-item collection.
+            let external_id = col.external_id.filter(|id| !id.starts_with("vaultwarden:item-access:"));
+            let new_collection = Collection::new(org_id.clone(), col.name, external_id);
             new_collection.save(&conn).await?;
             new_collection.uuid
         };

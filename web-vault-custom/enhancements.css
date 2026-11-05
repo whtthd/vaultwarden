@@ -1,0 +1,90 @@
+/* Keep the CDK scroll host and the visible results pane on the same element. */
+main#main-content.vw-vault-layout {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-height: 0;
+}
+.vw-vault {
+  display: flex;
+  flex: 1 1 0;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+}
+.vw-vault-panes {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow: hidden;
+}
+.vw-vault-panes > .vw-filter-pane,
+.vw-vault-panes > .vw-results-pane {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  scrollbar-gutter: stable;
+}
+.vw-vault-panes > .vw-results-pane { min-width: 0; }
+.vw-filter-pane:focus-visible,
+.vw-results-pane:focus-visible { outline: 2px solid currentColor; outline-offset: -2px; }
+.vw-descendant-access {
+  border: 1px solid rgb(var(--color-secondary-300));
+  border-radius: 0.375rem;
+  margin: 0 0 1.25rem;
+  padding: 1rem;
+}
+.vw-descendant-access legend { font-weight: 600; padding: 0 0.35rem; }
+.vw-access-hint, .vw-rename-note { font-size: 0.875rem; opacity: 0.8; }
+.vw-rename-note { margin: -0.5rem 0 1rem; }
+.vw-access-controls { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; margin-bottom: 0.5rem; }
+.vw-access-button { background: transparent; border: 0; color: rgb(var(--color-primary-600)); text-decoration: underline; cursor: pointer; font: inherit; padding: 0.25rem 0; }
+.vw-access-count { margin-left: auto; font-size: 0.875rem; }
+.vw-access-tree { max-height: 16rem; overflow: auto; overscroll-behavior: contain; }
+.vw-access-row { display: flex; align-items: center; gap: 0.75rem; padding: 0.25rem 0.25rem 0.25rem calc(var(--vw-depth) * 1rem); }
+.vw-access-row label { display: flex; align-items: center; gap: 0.5rem; min-width: 0; overflow-wrap: anywhere; }
+.vw-access-row input { width: 1rem; height: 1rem; flex-shrink: 0; accent-color: rgb(var(--color-primary-600)); }
+.vw-access-row .vw-access-button { margin-left: auto; flex-shrink: 0; font-size: 0.75rem; }
+.vw-descendant-revoke { border-top: 1px solid var(--color-border-base); margin-top: 0.75rem; padding-top: 0.75rem; }
+.vw-descendant-revoke h3 { font-size: 0.95rem; font-weight: 600; }
+.vw-revoke-controls { display: flex; align-items: end; flex-wrap: wrap; gap: 0.75rem; margin: 0.5rem 0; }
+.vw-revoke-controls label { display: flex; flex: 1 1 16rem; flex-direction: column; font-size: 0.875rem; gap: 0.35rem; min-width: 0; }
+.vw-revoke-controls select { background: var(--color-bg-primary); border: 1px solid var(--color-border-strong); border-radius: 0.375rem; color: inherit; padding: 0.4rem; width: 100%; }
+.vw-access-button:disabled { cursor: not-allowed; opacity: 0.5; }
+.vw-pending-revocations { list-style: none; margin: 0; padding: 0; }
+.vw-pending-revocations li { display: flex; flex-wrap: wrap; gap: 0.5rem; justify-content: space-between; font-size: 0.875rem; }
+.vw-item-access-trigger { margin-right: 0.35rem; opacity: 0.85; }
+.vw-item-access-trigger:hover, .vw-item-access-trigger:focus-visible { opacity: 1; }
+.vw-item-access-dialog {
+  background: var(--color-bg-primary);
+  border: 1px solid var(--color-border-base);
+  border-radius: 0.75rem;
+  color: var(--color-fg-body);
+  max-width: min(38rem, calc(100vw - 2rem));
+  padding: 0;
+  width: 100%;
+}
+.vw-item-access-dialog::backdrop { background: rgb(0 0 0 / 0.68); }
+.vw-item-access-dialog form { display: flex; flex-direction: column; max-height: min(80vh, 48rem); }
+.vw-item-access-dialog header, .vw-item-access-dialog footer { padding: 1.25rem 1.5rem; }
+.vw-item-access-dialog header { border-bottom: 1px solid var(--color-border-base); }
+.vw-item-access-dialog header h2 { margin: 0 0 0.25rem; font-size: 1.25rem; }
+.vw-item-access-dialog footer { border-top: 1px solid var(--color-border-base); display: flex; gap: 0.75rem; justify-content: flex-end; }
+.vw-item-access-body { display: flex; flex-direction: column; gap: 0.75rem; overflow: auto; padding: 1.25rem 1.5rem; }
+.vw-item-access-notice { background: var(--color-bg-secondary); border-radius: 0.5rem; margin: 0; padding: 0.75rem; }
+.vw-item-access-status { margin: 0; }
+.vw-item-search { background: transparent; border: 1px solid var(--color-border-strong); border-radius: 0.5rem; color: inherit; padding: 0.55rem 0.75rem; }
+.vw-item-members { display: flex; flex-direction: column; gap: 0.5rem; }
+.vw-item-member { align-items: center; display: grid; gap: 0.75rem; grid-template-columns: minmax(0, 1fr) minmax(10rem, 14rem); padding: 0.45rem 0; }
+.vw-item-member label { align-items: center; display: flex; gap: 0.5rem; min-width: 0; overflow-wrap: anywhere; }
+.vw-item-member select { background: var(--color-bg-primary); border: 1px solid var(--color-border-strong); border-radius: 0.45rem; color: inherit; min-width: 0; padding: 0.45rem; }
+.vw-item-member[hidden] { display: none; }
+.vw-item-member input[type="checkbox"] { accent-color: var(--color-bg-brand); flex-shrink: 0; height: 1rem; width: 1rem; }
+.vw-item-save { background: var(--color-bg-brand); border: 0; border-radius: 0.5rem; color: var(--color-fg-contrast); cursor: pointer; padding: 0.6rem 1rem; }
+.vw-item-cancel { background: transparent; border: 1px solid var(--color-border-strong); border-radius: 0.5rem; color: inherit; cursor: pointer; padding: 0.6rem 1rem; }
+@media (max-width: 767px) {
+  .vw-vault-panes { flex-direction: column; gap: 1rem; }
+  .vw-vault-panes > .vw-filter-pane { flex: 0 0 35%; max-width: 100%; }
+  .vw-vault-panes > .vw-results-pane { flex: 1 1 0; max-width: 100%; }
+  .vw-access-row { gap: 0.5rem; padding-left: calc(var(--vw-depth) * 0.5rem); }
+  .vw-item-member { align-items: stretch; grid-template-columns: 1fr; }
+}
