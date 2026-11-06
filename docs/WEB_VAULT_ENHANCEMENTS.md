@@ -38,6 +38,15 @@ For Chinese usage instructions and permission cautions, see
 - Missing parent paths appear as structural nodes, allowing a user with access
   only to descendants to browse the complete hierarchy. These nodes grant no
   access, have no edit/delete actions, and cannot be saved as real collections.
+- The member editor's Collections tab replaces the flat selector with an
+  expandable, searchable hierarchy. It supports individual, branch and global
+  operation scopes, bulk permission changes, bulk direct-grant removal and
+  per-row permission edits. Group-derived access is shown separately and stays
+  readonly. Scope selection is distinct from saved access, and partial scopes
+  clear with one click. Search preserves ancestor context but only matching
+  editable collections can be targeted; changing the query clears the scope
+  without discarding staged edits. All changes flow through the existing member
+  form and require its final Save; closing the dialog discards unsaved edits.
 - Renaming or moving a collection rewrites the path prefix of its descendants,
   retaining every collection ID, external ID, independent access grant and item
   association. Self-nesting, collisions and uneditable descendants reject the
@@ -189,6 +198,10 @@ typed revocation choices, item permission modes, cloning and one
 encrypted batch with local cache updates. Creation tests cover
 sibling duplicates, organization/parent separation, whitespace, Unicode-equivalent
 paths, legacy permission edits, fresh pre-create validation and validator cleanup.
+Member-editor tests cover hierarchy and duplicate IDs, missing ancestors,
+readonly/group-derived rows, filtered operation boundaries, all permission modes,
+independent grant preservation, selection clearing, CVA notifications and
+subscription cleanup.
 Preparation tests
 cover every pinned hook, both collection terminology modes, idempotence, resource
 cache busting, upgrade from the earlier local patch and exact restoration.

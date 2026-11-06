@@ -11,12 +11,14 @@
 
   const structuralPrefix = "vw-ancestor:";
   const dialogs = new Map();
+  const memberSelectors = new Map();
   const scrollHosts = new Set();
   const cipherRows = new Map();
   let itemDialog;
   let win;
   let scheduled = false;
   let layout;
+  let memberSelectorId = 0;
 
   function copy(model) {
     return Object.assign(Object.create(Object.getPrototypeOf(model)), model);
@@ -63,6 +65,114 @@
       if (remove) selected.delete(id);
       else selected.add(id);
     }
+  }
+
+  const memberPermissions = {
+    view: "查看项目", viewExceptPass: "查看项目，隐藏密码",
+    edit: "编辑项目", editExceptPass: "编辑项目，隐藏密码", manage: "管理集合",
+  };
+
+  function editableMemberCollection(item) {
+    return item.type === 0 && !item.readonly && item.viaGroupName == null && !item.vwStructuralOnly &&
+      typeof item.id === "string" && !item.id.startsWith(structuralPrefix);
+  }
+
+  function memberCollectionRows(items, query = "") {
+    const roots = new Map();
+    const search = query.trim().normalize("NFC").toLocaleLowerCase();
+    for (const item of items.filter((i) => i.type === 0)) {
+      const path = item.listName ?? item.labelName ?? "";
+      const parts = path.split("/");
+      let children = roots;
+      let node;
+      for (let depth = 0; depth < parts.length; depth++) {
+        const name = parts[depth];
+        if (!children.has(name)) {
+          children.set(name, { name, path: parts.slice(0, depth + 1).join("/"),
+            depth, children: new Map(), items: [], inherited: [], ids: [] });
+        }
+        node = children.get(name);
+        if (editableMemberCollection(item) && path.normalize("NFC").toLocaleLowerCase().includes(search)) {
+          node.ids.push(item.id);
+        }
+        children = node.children;
+      }
+      if (item.viaGroupName != null) node.inherited.push(item);
+      else node.items.push(item);
+    }
+    const rows = [];
+    function visit(nodes) {
+      for (const node of [...nodes.values()].sort((a, b) => a.name.localeCompare(b.name, "zh-CN"))) {
+        const matched = node.path.normalize("NFC").toLocaleLowerCase().includes(search);
+        // Keep matching readonly rows and their ancestors without making them write targets.
+        const children = [];
+        const previous = rows.length;
+        for (const item of node.items.length ? node.items : [undefined]) {
+          children.push({ ...node, item, matched, primary: children.length === 0,
+            duplicate: node.items.length > 1 });
+        }
+        rows.push(...children);
+        visit(node.children);
+        if (search && !matched && rows.length === previous + children.length) rows.splice(previous);
+      }
+    }
+    visit(roots);
+    return rows;
+  }
+
+  function planMemberCollectionAccess(items, values, ids, mode) {
+    if (mode !== null && !Object.hasOwn(memberPermissions, mode)) {
+      throw new Error("不支持的集合权限级别。");
+    }
+    const selected = new Set(ids);
+    if (!selected.size) throw new Error("请先选择要调整的集合。");
+    const allowed = new Set(items.filter(editableMemberCollection).map((i) => i.id));
+    if ([...selected].some((id) => !allowed.has(id))) {
+      throw new Error("部分集合不存在或无修改权限，请重新选择。");
+    }
+    const next = values.filter((v) => v.type !== 0 || !selected.has(v.id)).map((v) => ({ ...v }));
+    if (mode !== null) {
+      for (const id of selected) next.push({ id, type: 0, permission: mode });
+    }
+    return next;
+  }
+
+  function applyMemberCollectionAccess(component, ids, mode) {
+    if (component.disabled() || component.permissionMode() !== "edit") {
+      throw new Error("当前集合权限为只读，无法修改。");
+    }
+    const notify = component.notifyOnChange();
+    if (!notify) throw new Error("集合权限尚未加载完成，请稍后重试。");
+    const next = planMemberCollectionAccess(component.selectionList.allItems,
+      component.selectionList.formArray.getRawValue(), ids, mode);
+    // Reuse the upstream CVA: disabled group-derived rows stay out of the submitted direct grants.
+    component.writeValue(next);
+    const array = component.selectionList.formArray;
+    notify(array.disabled ? [] : array.value);
+    component.handleBlur();
+  }
+
+  function registerMemberCollectionSelector(component, host) {
+    if (memberSelectors.has(component) || host.getAttribute("formcontrolname") !== "access") return;
+    const state = { component, host, selected: new Set(), collapsed: new Set(), query: "" };
+    memberSelectors.set(component, state);
+    state.subscription = component.selectionList.formArray.valueChanges.subscribe(schedule);
+    if (win) {
+      state.observer = new win.MutationObserver(schedule);
+      state.observer.observe(host.closest("form") ?? host, {
+        attributes: true, subtree: true, attributeFilter: ["disabled", "aria-busy"],
+      });
+    }
+    schedule();
+  }
+
+  function unregisterMemberCollectionSelector(component) {
+    const state = memberSelectors.get(component);
+    state?.subscription.unsubscribe();
+    state?.observer?.disconnect();
+    state?.panel?.remove();
+    state?.host.classList.remove("vw-member-collections");
+    memberSelectors.delete(component);
   }
 
   function revocationCandidates(collections, selectedIds, subjects = []) {
@@ -313,6 +423,210 @@
     if (className) node.className = className;
     if (text) node.textContent = text;
     return node;
+  }
+
+  function memberSelectorBusy(state) {
+    const form = state.host.closest("form");
+    return state.component.disabled() || state.component.permissionMode() !== "edit" ||
+      !!form && [...form.querySelectorAll("button")].some((b) => b.type === "submit" && b.disabled);
+  }
+
+  function memberPermissionSelect(label, includeNone = false) {
+    const select = element("select", "vw-member-permission");
+    select.setAttribute("aria-label", label);
+    for (const [value, title] of [
+      ...(includeNone ? [["", "未直接授权"]] : []), ...Object.entries(memberPermissions),
+    ]) {
+      const option = element("option", "", title);
+      option.value = value;
+      select.append(option);
+    }
+    return select;
+  }
+
+  function memberCollectionAction(state, ids, mode) {
+    if (memberSelectorBusy(state)) return;
+    try {
+      applyMemberCollectionAccess(state.component, ids, mode);
+      state.status.textContent = mode === null ?
+        `已暂存 ${ids.length} 项直接授权移除，点击底部“保存”生效。` :
+        `已暂存 ${ids.length} 项“${memberPermissions[mode]}”，点击底部“保存”生效。`;
+      state.status.setAttribute("role", "status");
+    } catch (error) {
+      state.status.textContent = error.message || "无法调整集合权限，请重新打开窗口。";
+      state.status.setAttribute("role", "alert");
+    }
+    schedule();
+  }
+
+  function createMemberCollectionPanel(state) {
+    const panel = element("fieldset", "vw-member-collection-panel");
+    panel.append(element("legend", "", "按层级管理集合权限"),
+      element("p", "vw-access-hint",
+        "勾选用于批量操作，已有授权见每行权限；最后点击底部“保存”生效。群组及组织权限不变。"));
+    const searchLabel = element("label", "vw-member-collection-search", "搜索集合（含完整路径）");
+    const search = element("input", "vw-item-search");
+    search.type = "search";
+    search.placeholder = "输入集合名称或路径";
+    search.id = `vw-member-collection-search-${++memberSelectorId}`;
+    searchLabel.htmlFor = search.id;
+    search.addEventListener("input", () => {
+      state.query = search.value;
+      state.selected.clear();
+      schedule();
+    });
+    searchLabel.append(search);
+    panel.append(searchLabel, element("p", "vw-access-hint",
+      "筛选仅操作匹配项；换词清空选择，保留暂存修改。"));
+    const controls = element("div", "vw-access-controls");
+    const toggle = element("button", "vw-access-button", "全选集合");
+    toggle.type = "button";
+    toggle.addEventListener("click", () => { toggleSelection(state.selected, state.ids); schedule(); });
+    const fold = element("button", "vw-access-button", "折叠全部");
+    fold.type = "button";
+    fold.addEventListener("click", () => {
+      if (state.collapsed.size) state.collapsed.clear();
+      else for (const row of state.rows.filter((r) => r.children.size)) state.collapsed.add(row.path);
+      schedule();
+    });
+    const count = element("span", "vw-access-count");
+    count.setAttribute("aria-live", "polite");
+    controls.append(toggle, fold, count);
+    const actions = element("div", "vw-member-bulk-actions");
+    const permissionLabel = element("label", "", "批量权限");
+    const permission = memberPermissionSelect("批量设置集合权限");
+    permission.value = "view";
+    permissionLabel.append(permission);
+    const apply = element("button", "vw-member-apply", "应用到所选集合");
+    apply.type = "button";
+    apply.addEventListener("click", () => memberCollectionAction(state, [...state.selected], permission.value));
+    const remove = element("button", "vw-access-button", "移除所选直接授权");
+    remove.type = "button";
+    remove.addEventListener("click", () => memberCollectionAction(state, [...state.selected], null));
+    actions.append(permissionLabel, apply, remove);
+    const status = element("p", "vw-member-selection-status vw-access-hint",
+      "取消选择不会撤销暂存修改；关闭窗口可放弃。");
+    status.setAttribute("role", "status");
+    const tree = element("div", "vw-member-collection-tree");
+    tree.setAttribute("role", "group");
+    tree.setAttribute("aria-label", "成员集合权限树");
+    const empty = element("p", "vw-access-hint", "没有匹配的集合。");
+    panel.append(controls, actions, status, tree, empty);
+    Object.assign(state, { panel, search, toggle, fold, count, permission, apply, remove, tree, empty, status });
+    state.host.append(panel);
+    state.host.classList.add("vw-member-collections");
+  }
+
+  function renderMemberCollectionSelector(state) {
+    if (!state.host.isConnected || !state.host.closest("app-edit-member-dialog")) return;
+    if (!state.panel) createMemberCollectionPanel(state);
+    const items = state.component.selectionList.allItems;
+    const key = JSON.stringify([state.query, items.map((i) => [i.id, i.type, i.listName, i.labelName,
+      i.readonly, i.readonlyPermission, i.viaGroupName, i.vwStructuralOnly])]);
+    if (state.treeKey !== key) {
+      state.treeKey = key;
+      state.rows = memberCollectionRows(items, state.query);
+      state.ids = [...new Set(state.rows.flatMap((r) => r.ids))];
+      const allowed = new Set(state.ids);
+      state.selected = new Set([...state.selected].filter((id) => allowed.has(id)));
+      state.views = [];
+      const nodes = [];
+      for (const row of state.rows) {
+        const node = element("div", "vw-member-collection-row");
+        node.style.setProperty("--vw-depth", Math.min(row.depth, 12));
+        const heading = element("div", "vw-member-collection-name");
+        const check = element("input");
+        check.type = "checkbox";
+        check.setAttribute("aria-label", `选择集合 ${row.path}${row.duplicate && row.item ? ` [${row.item.id}]` : ""}`);
+        check.addEventListener("change", () => {
+          if (!row.item) return;
+          if (check.checked) state.selected.add(row.item.id);
+          else state.selected.delete(row.item.id);
+          schedule();
+        });
+        const fold = element("button", "vw-member-expand");
+        fold.type = "button";
+        fold.addEventListener("click", () => {
+          if (state.collapsed.has(row.path)) state.collapsed.delete(row.path);
+          else state.collapsed.add(row.path);
+          schedule();
+        });
+        const name = element("span", "", row.name || "（空名称）");
+        name.title = row.path;
+        heading.append(check, fold, name);
+        if (row.duplicate && row.item) heading.append(element("small", "vw-access-hint", `[${row.item.id.slice(0, 8)}]`));
+        if (!row.item) heading.append(element("small", "vw-access-hint", row.inherited.length ? "群组授权" : "上级结构"));
+        node.append(heading);
+        let select;
+        if (row.item && editableMemberCollection(row.item)) {
+          select = memberPermissionSelect(`${row.path}${row.duplicate ? ` [${row.item.id}]` : ""} 的直接权限`, true);
+          select.addEventListener("change", () => memberCollectionAction(state, [row.item.id], select.value || null));
+          node.append(select);
+        } else {
+          node.append(element("span", "vw-member-readonly vw-access-hint", row.item ?
+            (memberPermissions[row.item.readonlyPermission] || "不可修改") : "无直接授权"));
+        }
+        let branch;
+        if (row.primary && (row.children.size || row.duplicate)) {
+          branch = element("button", "vw-access-button", "全选分支");
+          branch.type = "button";
+          branch.addEventListener("click", () => { toggleSelection(state.selected, row.ids); schedule(); });
+          node.append(branch);
+        }
+        if (row.primary && row.inherited.length) {
+          const inherited = element("div", "vw-member-inherited vw-access-hint");
+          for (const grant of row.inherited) inherited.append(element("span", "",
+            `群组 ${grant.viaGroupName}：${memberPermissions[grant.readonlyPermission] || "已有权限"}`));
+          node.append(inherited);
+        }
+        state.views.push({ row, node, check, fold, select, branch });
+        nodes.push(node);
+      }
+      state.tree.replaceChildren(...nodes);
+    }
+    const busy = memberSelectorBusy(state);
+    const setDisabled = (control, disabled) => { if (control.disabled !== disabled) control.disabled = disabled; };
+    const setText = (node, text) => { if (node.textContent !== text) node.textContent = text; };
+    const values = new Map(state.component.selectionList.formArray.getRawValue()
+      .filter((v) => v.type === 0).map((v) => [v.id, v.permission]));
+    const scope = selectionState(state.selected, state.ids);
+    setText(state.toggle, scope.all || scope.mixed ? "取消选择" : state.query.trim() ? "全选筛选结果" : "全选集合");
+    if (state.toggle.getAttribute("aria-pressed") !== String(scope.all || scope.mixed)) {
+      state.toggle.setAttribute("aria-pressed", String(scope.all || scope.mixed));
+    }
+    setText(state.fold, state.collapsed.size ? "展开全部" : "折叠全部");
+    const directCount = items.filter((i) => editableMemberCollection(i) && values.has(i.id)).length;
+    setText(state.count, `已选 ${state.selected.size} / ${state.ids.length} · 直接授权 ${directCount} 项`);
+    setDisabled(state.search, busy);
+    setDisabled(state.toggle, busy || !state.ids.length);
+    setDisabled(state.fold, !!state.query.trim() || !state.rows.some((r) => r.children.size));
+    setDisabled(state.permission, busy);
+    setDisabled(state.apply, busy || !state.selected.size);
+    setDisabled(state.remove, busy || !state.selected.size);
+    state.empty.hidden = state.rows.length > 0;
+    for (const view of state.views) {
+      const { row, node, check, fold, select, branch } = view;
+      const ancestors = row.path.split("/").slice(0, -1).map((_, i, parts) => parts.slice(0, i + 1).join("/"));
+      node.hidden = !state.query.trim() && ancestors.some((path) => state.collapsed.has(path));
+      check.checked = !!row.item && state.selected.has(row.item.id);
+      setDisabled(check, busy || !row.matched || !row.item || !editableMemberCollection(row.item));
+      fold.hidden = !row.primary || !row.children.size;
+      setDisabled(fold, !!state.query.trim());
+      const expanded = !state.collapsed.has(row.path) || !!state.query.trim();
+      setText(fold, expanded ? "−" : "+");
+      fold.setAttribute("aria-label", `${expanded ? "折叠" : "展开"}集合 ${row.path}`);
+      fold.setAttribute("aria-expanded", String(expanded));
+      if (select) {
+        select.value = values.get(row.item.id) ?? "";
+        setDisabled(select, busy || !row.matched);
+      }
+      if (branch) {
+        const status = selectionState(state.selected, row.ids);
+        setText(branch, status.all || status.mixed ? "取消分支" : "全选分支");
+        branch.setAttribute("aria-label", `${status.all || status.mixed ? "取消选择分支" : "全选分支"} ${row.path}`);
+        setDisabled(branch, busy || !row.ids.length);
+      }
+    }
   }
 
   function registerCollectionDialog(component) {
@@ -796,6 +1110,7 @@
       scheduled = false;
       updateLayout();
       renderCipherRows();
+      for (const state of memberSelectors.values()) renderMemberCollectionSelector(state);
       for (const state of dialogs.values()) {
         if (state.panel && !state.collections && !state.error) continue;
         if (state.panel && state.error && !state.collections) {
@@ -839,5 +1154,7 @@
     planCollectionUpdate, accessDelta, applyDelta, isDescendant, navigationKey,
     searchMatchesInput, descendantRows, selectionState, toggleSelection, revocationCandidates,
     cloneSourceWithoutItemAccess, itemGrants, saveItemAccess,
+    memberCollectionRows, planMemberCollectionAccess, applyMemberCollectionAccess,
+    registerMemberCollectionSelector, unregisterMemberCollectionSelector,
     registerCipherRow, unregisterCipherRow, canAssignItemAccess };
 });

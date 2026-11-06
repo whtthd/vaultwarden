@@ -55,6 +55,12 @@ ENHANCEMENT_PATCHES = [
         'window.VaultwardenEnhancements.createCollection(this,c,u,v._)',
     ),
     (
+        'this.selectionList.formArray.disabled?t([]):t(e))})}registerOnChange(e)',
+        'this.selectionList.formArray.disabled?t([]):t(e))}),'
+        'window.VaultwardenEnhancements.registerMemberCollectionSelector(this,(0,r.WQX)(w.aKT).nativeElement)}'
+        'ngOnDestroy(){window.VaultwardenEnhancements.unregisterMemberCollectionSelector(this)}registerOnChange(e)',
+    ),
+    (
         '93817(e,t,i){"use strict";i.d(t,{l:()=>qe});var n=i(15639)',
         '93817(e,t,i){"use strict";i.d(t,{l:()=>qe});var vwCollectionAdmin=i(21571).vE,n=i(15639)',
     ),

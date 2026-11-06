@@ -579,3 +579,185 @@ test('an empty single-item response removes a stale local reserved association',
   assert.equal(requests.length, 1);
   assert.deepEqual(stored.collectionIds, ['other-collection']);
 });
+
+function memberCollection(id, path, extra = {}) {
+  return { id, type: 0, listName: path, labelName: path, ...extra };
+}
+
+test('member collection tree keeps ancestors, real duplicate IDs and readonly group grants', () => {
+  const rows = enhancements.memberCollectionRows([
+    memberCollection('leaf', 'A/Missing/Leaf'), memberCollection('root', 'A'),
+    memberCollection('duplicate-one', 'B/Shared'), memberCollection('duplicate-two', 'B/Shared'),
+    memberCollection('leaf-group', 'A/Missing/Leaf', { readonly: true, viaGroupName: 'Team', readonlyPermission: 'edit' }),
+    { id: 'not-a-collection', type: 1, listName: 'Excluded' },
+  ]);
+  assert.deepEqual(rows.map((r) => [r.path, r.item?.id]), [
+    ['A', 'root'], ['A/Missing', undefined], ['A/Missing/Leaf', 'leaf'],
+    ['B', undefined], ['B/Shared', 'duplicate-one'], ['B/Shared', 'duplicate-two'],
+  ]);
+  assert.deepEqual(rows[0].ids, ['leaf', 'root']);
+  assert.deepEqual(rows[1].ids, ['leaf']);
+  assert.equal(rows[2].inherited[0].viaGroupName, 'Team');
+  assert.deepEqual(rows[3].ids, ['duplicate-one', 'duplicate-two']);
+  assert.equal(rows[4].primary, true);
+  assert.equal(rows[5].primary, false);
+  assert.equal(rows[4].duplicate, true);
+});
+
+test('member tree search retains context without granting unmatched parents or siblings', () => {
+  const items = [memberCollection('root', 'Root'), memberCollection('branch', 'Root/Branch'),
+    memberCollection('target', 'Root/Branch/Target'), memberCollection('sibling', 'Root/Branch/Other'),
+    memberCollection('prefix', 'Root/BranchBackup/Other'), memberCollection('outside', 'Elsewhere')];
+  const rows = enhancements.memberCollectionRows(items, '  target  ');
+  assert.deepEqual(rows.map((r) => r.path), ['Root', 'Root/Branch', 'Root/Branch/Target']);
+  assert.deepEqual(rows.map((r) => r.matched), [false, false, true]);
+  assert.ok(rows.every((r) => r.ids.length === 1 && r.ids[0] === 'target'));
+  const branch = enhancements.memberCollectionRows(items).find((r) => r.item?.id === 'branch');
+  assert.deepEqual(branch.ids, ['branch', 'target', 'sibling']);
+  assert.deepEqual(enhancements.memberCollectionRows(items, 'absent'), []);
+});
+
+test('member tree search includes readonly matches but no writable synthetic or inherited IDs', () => {
+  const items = [memberCollection('leaf-group', 'Invisible/Leaf', {
+    readonly: true, viaGroupName: 'Team', readonlyPermission: 'view',
+  }), memberCollection('protected', 'Protected', { readonly: true }),
+  memberCollection('vw-ancestor:org:path', 'Synthetic'),
+  memberCollection('structural', 'Structure', { vwStructuralOnly: true }),
+  memberCollection('empty-group', 'Group', { viaGroupName: '' })];
+  const rows = enhancements.memberCollectionRows(items, 'leaf');
+  assert.deepEqual(rows.map((r) => r.path), ['Invisible', 'Invisible/Leaf']);
+  assert.ok(enhancements.memberCollectionRows(items).every((r) => r.ids.length === 0));
+  assert.equal(rows[1].item, undefined);
+  assert.equal(rows[1].inherited[0].id, 'leaf-group');
+});
+
+test('member scope selection and clearing never change the saved or staged direct grants', () => {
+  const values = [{ id: 'parent', type: 0, permission: 'view' }];
+  const selected = new Set();
+  const branch = enhancements.memberCollectionRows([
+    memberCollection('parent', 'A'), memberCollection('child', 'A/B'),
+    memberCollection('other', 'AB/C'),
+  ])[0];
+  enhancements.toggleSelection(selected, branch.ids);
+  assert.deepEqual([...selected], ['parent', 'child']);
+  enhancements.toggleSelection(selected, branch.ids);
+  assert.deepEqual([...selected], []);
+  assert.deepEqual(values, [{ id: 'parent', type: 0, permission: 'view' }]);
+});
+
+test('member bulk grant and revoke change only exact chosen direct grants and preserve other dimensions', () => {
+  const items = [memberCollection('parent', 'A'), memberCollection('child', 'A/B'),
+    memberCollection('sibling', 'A/C'), memberCollection('readonly', 'Protected', { readonly: true }),
+    memberCollection('group-derived', 'A/B', { readonly: true, viaGroupName: 'Team' })];
+  const initial = [{ id: 'sibling', type: 0, permission: 'manage' },
+    { id: 'readonly', type: 0, permission: 'view' }, { id: 'group-derived', type: 0, permission: 'edit' },
+    { id: 'actual-group', type: 1 }];
+  const granted = enhancements.planMemberCollectionAccess(items, initial, ['parent', 'child'], 'viewExceptPass');
+  assert.deepEqual(granted.slice(0, initial.length), initial);
+  assert.deepEqual(granted.slice(initial.length), [
+    { id: 'parent', type: 0, permission: 'viewExceptPass' },
+    { id: 'child', type: 0, permission: 'viewExceptPass' },
+  ]);
+  const revoked = enhancements.planMemberCollectionAccess(items, granted, ['child'], null);
+  assert.deepEqual(revoked, [...initial, { id: 'parent', type: 0, permission: 'viewExceptPass' }]);
+  assert.deepEqual(enhancements.planMemberCollectionAccess(items, revoked, ['child'], null), revoked);
+  assert.equal(initial.length, 4);
+});
+
+test('member permission planner rejects structural, inherited, readonly and unknown scopes atomically', () => {
+  const items = [memberCollection('allowed', 'A'), memberCollection('readonly', 'B', { readonly: true }),
+    memberCollection('inherited', 'C', { viaGroupName: 'Team', readonly: true }),
+    memberCollection('vw-ancestor:org:path', 'D')];
+  const values = [{ id: 'allowed', type: 0, permission: 'view' }];
+  for (const id of ['readonly', 'inherited', 'vw-ancestor:org:path', 'foreign-org-id']) {
+    assert.throws(() => enhancements.planMemberCollectionAccess(items, values, ['allowed', id], 'manage'), /无修改权限/);
+  }
+  assert.throws(() => enhancements.planMemberCollectionAccess(items, values, [], 'view'), /先选择/);
+  for (const mode of ['unknown', undefined, '__proto__', 'view-hidden']) {
+    assert.throws(() => enhancements.planMemberCollectionAccess(items, values, ['allowed'], mode), /不支持/);
+  }
+  assert.deepEqual(values, [{ id: 'allowed', type: 0, permission: 'view' }]);
+});
+
+test('member planner supports all upstream modes, deduplicates scope and does not implicitly add descendants', () => {
+  const items = [memberCollection('parent', 'A'), memberCollection('child', 'A/B')];
+  for (const mode of ['view', 'viewExceptPass', 'edit', 'editExceptPass', 'manage']) {
+    assert.deepEqual(enhancements.planMemberCollectionAccess(items, [], ['parent', 'parent'], mode),
+      [{ id: 'parent', type: 0, permission: mode }]);
+  }
+});
+
+test('member edits flow through the upstream form once and exclude disabled group-derived rows from submission', () => {
+  const items = [memberCollection('one', 'A'), memberCollection('other', 'B'),
+    memberCollection('inherited', 'A', { readonly: true, viaGroupName: 'Team' })];
+  let raw = [{ id: 'other', type: 0, permission: 'edit' }, { id: 'inherited', type: 0, permission: 'manage' }];
+  const notifications = [];
+  let touched = 0, writes = 0;
+  const array = { getRawValue: () => raw, get value() { return raw.filter((v) => v.id !== 'inherited'); } };
+  const component = { disabled: () => false, permissionMode: () => 'edit',
+    selectionList: { allItems: items, formArray: array },
+    writeValue: (value) => { raw = value; writes++; },
+    notifyOnChange: () => (value) => notifications.push(value), handleBlur: () => touched++,
+  };
+  enhancements.applyMemberCollectionAccess(component, ['one'], 'view');
+  assert.equal(writes, 1);
+  assert.equal(touched, 1);
+  assert.deepEqual(notifications, [[{ id: 'other', type: 0, permission: 'edit' }, { id: 'one', type: 0, permission: 'view' }]]);
+  assert.ok(raw.some((v) => v.id === 'inherited' && v.permission === 'manage'));
+  enhancements.applyMemberCollectionAccess(component, ['one'], null);
+  assert.equal(writes, 2);
+  assert.deepEqual(notifications[1], [{ id: 'other', type: 0, permission: 'edit' }]);
+  component.disabled = () => true;
+  assert.throws(() => enhancements.applyMemberCollectionAccess(component, ['other'], null), /只读/);
+  component.disabled = () => false;
+  component.permissionMode = () => 'readonly';
+  assert.throws(() => enhancements.applyMemberCollectionAccess(component, ['other'], null), /只读/);
+  component.permissionMode = () => 'edit';
+  component.notifyOnChange = () => null;
+  assert.throws(() => enhancements.applyMemberCollectionAccess(component, ['other'], null), /尚未加载/);
+  assert.equal(writes, 2);
+});
+
+test('member selector hooks register once, skip other form controls and unsubscribe on destruction', () => {
+  let subscriptions = 0, unsubscribed = 0, disconnected = 0;
+  enhancements.start({ document: { documentElement: {}, addEventListener() {} },
+    MutationObserver: class { observe() {} disconnect() { disconnected++; } },
+    requestAnimationFrame() {}, addEventListener() {},
+  });
+  const component = { selectionList: { formArray: { valueChanges: { subscribe: () => {
+    subscriptions++;
+    return { unsubscribe: () => { unsubscribed++; } };
+  } } } } };
+  const host = { getAttribute: () => 'access', closest: () => null, classList: { remove() {} } };
+  enhancements.registerMemberCollectionSelector(component, host);
+  enhancements.registerMemberCollectionSelector(component, host);
+  enhancements.registerMemberCollectionSelector({}, { getAttribute: () => 'groups' });
+  assert.equal(subscriptions, 1);
+  enhancements.unregisterMemberCollectionSelector(component);
+  enhancements.unregisterMemberCollectionSelector(component);
+  assert.equal(unsubscribed, 1);
+  assert.equal(disconnected, 1);
+});
+
+test('revoking the last direct grant cannot submit disabled group-derived or protected IDs', () => {
+  const items = [memberCollection('direct', 'A'),
+    memberCollection('collection-group-synthetic-id', 'A', { readonly: true, viaGroupName: 'Team' }),
+    memberCollection('protected', 'Protected', { readonly: true })];
+  let raw = [{ id: 'direct', type: 0, permission: 'view' },
+    { id: 'collection-group-synthetic-id', type: 0, permission: 'manage' },
+    { id: 'protected', type: 0, permission: 'view' }];
+  const notifications = [];
+  const array = { getRawValue: () => raw,
+    get disabled() { return !raw.some((v) => v.id === 'direct'); },
+    // Angular disabled arrays expose all their disabled children's values.
+    get value() { return this.disabled ? raw : raw.filter((v) => v.id === 'direct'); },
+  };
+  const component = { disabled: () => false, permissionMode: () => 'edit',
+    selectionList: { allItems: items, formArray: array },
+    writeValue: (next) => { raw = next; }, notifyOnChange: () => (value) => notifications.push(value),
+    handleBlur() {},
+  };
+  enhancements.applyMemberCollectionAccess(component, ['direct'], null);
+  assert.equal(raw.length, 2);
+  assert.deepEqual(notifications, [[]]);
+});

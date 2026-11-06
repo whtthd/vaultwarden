@@ -46,6 +46,9 @@ class PreparationTests(unittest.TestCase):
         self.assertIn(b'{collectionId:t,sharedFolderId:null,search:null}', patched)
         self.assertIn(b'window.VaultwardenEnhancements.createCollection(this,c,u,v._)', patched)
         self.assertNotIn(b'this.collectionAdminService.create(c,u)', patched)
+        self.assertIn(
+            b'registerMemberCollectionSelector(this,(0,r.WQX)(w.aKT).nativeElement)', patched)
+        self.assertIn(b'ngOnDestroy(){window.VaultwardenEnhancements.unregisterMemberCollectionSelector(this)}', patched)
 
     def test_prepare_is_idempotent_and_restore_is_exact(self):
         self.prepare(local_dev=True)
