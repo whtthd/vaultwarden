@@ -1,0 +1,231 @@
+name: Build and publish Docker image
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+      - "[0-9]+.[0-9]+.[0-9]+"
+  pull_request:
+    paths:
+      - ".github/workflows/docker-publish.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "Cargo.*"
+      - "Dockerfile"
+      - ".dockerignore"
+      - "build.rs"
+      - "docker/**"
+      - "macros/**"
+      - "migrations/**"
+      - "src/**"
+      - "tools/prepare_web_vault.py"
+      - "tools/test_prepare_web_vault.py"
+      - "tools/web_vault_patches.py"
+      - "web-vault-custom/**"
+      - "rust-toolchain.toml"
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # Configure this repository variable to the Docker Hub namespace/repository,
+  # for example: iris/vaultwarden-custom.
+  DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
+  # Pull requests only build locally and use this harmless metadata fallback.
+  IMAGE_NAME: ${{ vars.DOCKERHUB_REPOSITORY || 'local/vaultwarden-ci' }}
+  WEB_VAULT_IMAGE: docker.io/vaultwarden/web-vault@sha256:7baaa7d5349742548b6c44e557c1512157b22010cdf314ccc399ffdcacb5eb52
+
+jobs:
+  image:
+    name: Build and publish Docker image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.x"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22.x"
+
+      - name: Fetch pinned web-vault assets
+        run: |
+          set -euo pipefail
+          docker pull "${WEB_VAULT_IMAGE}"
+          container_id="$(docker create "${WEB_VAULT_IMAGE}")"
+          cleanup() {
+            docker rm -f "${container_id}" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          mkdir -p web-vault
+          docker cp "${container_id}:/web-vault/." web-vault/
+          test -f web-vault/index.html
+          test -f web-vault/app/main.1176a28a68b7b4809391.js
+
+      - name: Apply production web-vault enhancements
+        run: python3 tools/prepare_web_vault.py
+
+      - name: Validate web-vault enhancements
+        run: |
+          set -euo pipefail
+          node --test web-vault-custom/enhancements.test.cjs
+          python3 tools/test_prepare_web_vault.py
+
+      - name: Determine embedded server version
+        id: version
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="1.0.0-ci.${GITHUB_RUN_NUMBER}"
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Prepare named web-vault build context
+        run: |
+          set -euo pipefail
+          mkdir -p .ci/web-vault-context
+          cp -a web-vault .ci/web-vault-context/web-vault
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source = Path("Dockerfile").read_text()
+          upstream = (
+              "FROM --platform=linux/amd64 "
+              "docker.io/vaultwarden/web-vault@"
+              "sha256:7baaa7d5349742548b6c44e557c1512157b22010cdf314ccc399ffdcacb5eb52 "
+              "AS vault"
+          )
+          if source.count(upstream) != 1:
+              raise SystemExit("Dockerfile web-vault stage no longer matches the pinned release")
+
+          custom = source.replace(upstream, "FROM vault AS webvault", 1)
+          if custom.count("COPY --from=vault /web-vault ./web-vault") != 1:
+              raise SystemExit("Dockerfile web-vault copy stage no longer matches")
+          custom = custom.replace(
+              "COPY --from=vault /web-vault ./web-vault",
+              "COPY --from=webvault /web-vault ./web-vault",
+              1,
+          )
+          Path(".ci/Dockerfile.debian").write_text(custom)
+          PY
+
+          test -f .ci/Dockerfile.debian
+          grep -Fq "FROM vault AS webvault" .ci/Dockerfile.debian
+          grep -Fq "COPY --from=webvault /web-vault ./web-vault" .ci/Dockerfile.debian
+
+      - name: Validate Docker Hub configuration
+        if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') }}
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${DOCKERHUB_REPOSITORY}" ]]; then
+            echo "::error::Repository variable DOCKERHUB_REPOSITORY is required (for example: iris/vaultwarden-custom)."
+            exit 1
+          fi
+          if [[ ! "${DOCKERHUB_REPOSITORY}" =~ ^[a-z0-9._-]+/[a-z0-9._-]+$ ]]; then
+            echo "::error::DOCKERHUB_REPOSITORY must be a lowercase Docker Hub namespace/repository."
+            exit 1
+          fi
+          if [[ -z "${DOCKERHUB_USERNAME}" || -z "${DOCKERHUB_TOKEN}" ]]; then
+            echo "::error::DOCKERHUB_USERNAME and DOCKERHUB_TOKEN secrets are required."
+            exit 1
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          cache-binary: false
+          buildkitd-config-inline: |
+            [worker.oci]
+              max-parallelism = 2
+
+      - name: Log in to Docker Hub
+        if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') }}
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Generate image metadata
+        id: metadata
+        uses: docker/metadata-action@c1e51972afc2121e065aed6d45c65596fe445f3f # v5.8.0
+        with:
+          images: docker.io/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=Vaultwarden
+            org.opencontainers.image.description=Vaultwarden with the local collection and permission enhancements
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            vaultwarden.web-vault=2026.10.1
+            vaultwarden.local-dev-unlock=disabled
+            vaultwarden.database-backend=postgresql
+
+      - name: Build and publish image
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          file: .ci/Dockerfile.debian
+          build-contexts: |
+            vault=.ci/web-vault-context
+          platforms: linux/amd64
+          push: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') }}
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          build-args: |
+            DB=postgresql
+            CARGO_PROFILE=release
+            VW_VERSION=${{ steps.version.outputs.version }}
+          cache-from: type=gha,scope=vaultwarden-postgresql-amd64
+          cache-to: type=gha,mode=max,scope=vaultwarden-postgresql-amd64,ignore-error=true
+          provenance: false
+          sbom: false
+
+      - name: Write image summary
+        if: ${{ success() }}
+        env:
+          IMAGE_TAGS: ${{ steps.metadata.outputs.tags }}
+          IMAGE_DIGEST: ${{ steps.metadata.outputs.digest }}
+          SERVER_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          {
+            echo "### Docker image"
+            echo
+            echo "- Repository: \`docker.io/${IMAGE_NAME}\`"
+            echo "- Platform: \`linux/amd64\`"
+            echo "- Embedded server version: \`${SERVER_VERSION}\`"
+            echo "- Digest: \`${IMAGE_DIGEST:-validation-only}\`"
+            echo "- Tags:"
+            sed 's/^/  - `/; s/$/`/' <<< "${IMAGE_TAGS}"
+          } >> "${GITHUB_STEP_SUMMARY}"
