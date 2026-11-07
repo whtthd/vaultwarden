@@ -40,10 +40,11 @@ defaults:
 
 env:
   # Configure this repository variable to the Docker Hub namespace/repository,
-  # for example: iris/vaultwarden-custom.
+  # for example: iris/vaultwarden-custom. If it is omitted, the workflow uses
+  # <DOCKERHUB_USERNAME>/vaultwarden.
   DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
   # Pull requests only build locally and use this harmless metadata fallback.
-  IMAGE_NAME: ${{ vars.DOCKERHUB_REPOSITORY || 'local/vaultwarden-ci' }}
+  IMAGE_NAME: local/vaultwarden-ci
   WEB_VAULT_IMAGE: docker.io/vaultwarden/web-vault@sha256:7baaa7d5349742548b6c44e557c1512157b22010cdf314ccc399ffdcacb5eb52
 
 jobs:
@@ -60,14 +61,27 @@ jobs:
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.0.0
         with:
           python-version: "3.x"
 
       - name: Set up Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: "22.x"
+
+      - name: Resolve Docker Hub image repository
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          PUBLISH_IMAGE: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') }}
+        run: |
+          set -euo pipefail
+          if [[ "${PUBLISH_IMAGE}" != "true" ]]; then
+            exit 0
+          fi
+          repository="${DOCKERHUB_REPOSITORY:-${DOCKERHUB_USERNAME}/vaultwarden}"
+          echo "DOCKERHUB_REPOSITORY=${repository}" >> "${GITHUB_ENV}"
+          echo "IMAGE_NAME=${repository}" >> "${GITHUB_ENV}"
 
       - name: Fetch pinned web-vault assets
         run: |
@@ -145,16 +159,16 @@ jobs:
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           set -euo pipefail
+          if [[ -z "${DOCKERHUB_USERNAME}" || -z "${DOCKERHUB_TOKEN}" ]]; then
+            echo "::error::DOCKERHUB_USERNAME and DOCKERHUB_TOKEN secrets are required."
+            exit 1
+          fi
           if [[ -z "${DOCKERHUB_REPOSITORY}" ]]; then
-            echo "::error::Repository variable DOCKERHUB_REPOSITORY is required (for example: iris/vaultwarden-custom)."
+            echo "::error::Docker Hub image repository could not be determined."
             exit 1
           fi
           if [[ ! "${DOCKERHUB_REPOSITORY}" =~ ^[a-z0-9._-]+/[a-z0-9._-]+$ ]]; then
             echo "::error::DOCKERHUB_REPOSITORY must be a lowercase Docker Hub namespace/repository."
-            exit 1
-          fi
-          if [[ -z "${DOCKERHUB_USERNAME}" || -z "${DOCKERHUB_TOKEN}" ]]; then
-            echo "::error::DOCKERHUB_USERNAME and DOCKERHUB_TOKEN secrets are required."
             exit 1
           fi
 

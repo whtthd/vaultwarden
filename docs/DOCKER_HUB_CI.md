@@ -10,14 +10,14 @@ Configure these values in the repository settings:
 
 | Type | Name | Example |
 | --- | --- | --- |
-| Repository variable | `DOCKERHUB_REPOSITORY` | `iris/vaultwarden-custom` |
+| Repository variable | `DOCKERHUB_REPOSITORY` | `iris/vaultwarden-custom` (optional) |
 | Repository secret | `DOCKERHUB_USERNAME` | Docker Hub login name |
 | Repository secret | `DOCKERHUB_TOKEN` | Docker Hub access token with push permission |
 
 The secret must be a Docker Hub access token rather than a personal password.
-The repository variable is intentionally separate from the credentials so the
-image destination remains visible in workflow configuration without exposing
-the token.
+If `DOCKERHUB_REPOSITORY` is omitted, the workflow uses
+`<DOCKERHUB_USERNAME>/vaultwarden`. The repository variable is useful when the
+Docker Hub repository has a different name or belongs to an organization.
 
 The workflow runs on changes to the server, migrations, Docker files, web-vault
 enhancement code and the workflow itself. Pull requests build and validate the
