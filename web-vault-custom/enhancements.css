@@ -27,6 +27,21 @@ main#main-content.vw-vault-layout {
 .vw-vault-panes > .vw-results-pane { min-width: 0; }
 .vw-filter-pane:focus-visible,
 .vw-results-pane:focus-visible { outline: 2px solid currentColor; outline-offset: -2px; }
+/* Keep the filter title and search field available while the collection tree scrolls. */
+.vw-filter-pane app-vault-filter [data-testid="filters-header"] {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+}
+.vw-filter-pane app-vault-filter [data-testid="filters-body"] > .tw-mb-4 {
+  position: sticky;
+  top: var(--vw-filter-header-height, 3rem);
+  z-index: 4;
+  margin-inline: -1.25rem;
+  padding-inline: 1.25rem;
+  padding-bottom: 1rem;
+  background: var(--color-bg-primary);
+}
 .vw-descendant-access {
   border: 1px solid rgb(var(--color-secondary-300));
   border-radius: 0.375rem;

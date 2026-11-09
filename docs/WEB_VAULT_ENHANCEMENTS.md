@@ -10,10 +10,11 @@ For Chinese usage instructions and permission cautions, see
 
 ## Behavior
 
-- The filter tree and results list scroll independently. The header stays visible.
-  The results pane is also the Angular CDK virtual list's scroll host, so large
-  vaults continue rendering rows as they scroll. Selecting a filter resets only
-  the results scroll position.
+- The filter tree and results list scroll independently. The filter title and
+  search field stay pinned at the top of the left pane while its collection tree
+  scrolls. The results pane is also the Angular CDK virtual list's scroll host,
+  so large vaults continue rendering rows as they scroll. Selecting a filter
+  resets only the results scroll position.
 - Selecting a collection, folder, organization or item type clears the previous
   text search. Following a collection from search results also clears it. A
   pending search debounce cannot restore text cleared by navigation.

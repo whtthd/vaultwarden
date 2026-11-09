@@ -11,6 +11,15 @@ test('every pinned bundle hook is exported by the enhancement runtime', () => {
   for (const name of hooks) assert.equal(typeof enhancements[name], 'function', name);
 });
 
+test('filter title and search area use the left pane sticky layout', () => {
+  const fs = require('node:fs');
+  const css = fs.readFileSync(require('node:path').join(__dirname, 'enhancements.css'), 'utf8');
+  assert.match(css, /\.vw-filter-pane app-vault-filter \[data-testid="filters-header"\][\s\S]*position:\s*sticky/);
+  assert.match(css, /\.vw-filter-pane app-vault-filter \[data-testid="filters-body"\] > \.tw-mb-4[\s\S]*position:\s*sticky/);
+  assert.match(css, /top:\s*var\(--vw-filter-header-height/);
+  assert.match(css, /background:\s*var\(--color-bg-primary\)/);
+});
+
 function collection(id, name, extra = {}) {
   return { id, name, organizationId: 'org', externalId: 'external-' + id, users: [], groups: [],
     canEdit: () => true, canEditName: () => true, ...extra };

@@ -411,6 +411,17 @@
     scrollHosts.delete(host);
   }
 
+  function updateFilterStickyOffset(filters) {
+    const header = filters.querySelector(
+      'app-vault-filter [data-testid="filters-header"]');
+    if (!header) {
+      filters.style.removeProperty("--vw-filter-header-height");
+      return;
+    }
+    const height = Math.ceil(header.getBoundingClientRect().height);
+    if (height > 0) filters.style.setProperty("--vw-filter-header-height", `${height}px`);
+  }
+
   function updateLayout() {
     const vault = win.document.querySelector("main#main-content app-vault");
     const row = vault && [...vault.children].find((e) => e.classList.contains("tw-flex-row"));
@@ -429,6 +440,7 @@
     }
     const main = vault.closest("main");
     const [filters, results] = row.children;
+    updateFilterStickyOffset(filters);
     if (!layout || layout.results !== results) {
       main.classList.add("vw-vault-layout");
       vault.classList.add("vw-vault");
