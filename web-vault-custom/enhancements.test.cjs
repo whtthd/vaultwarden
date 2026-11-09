@@ -25,7 +25,8 @@ function treeNode(node, parent, name) {
 function tree(collections) {
   const nodes = [];
   for (const model of collections) {
-    nestedCollectionTraverse(nodes, 0, model.name.split('/'), model, undefined, '/', treeNode);
+    const parts = model.name ? model.name.replace(/^\/+|\/+$/g, '').split('/') : [];
+    nestedCollectionTraverse(nodes, 0, parts, model, undefined, '/', treeNode);
   }
   return nodes;
 }
@@ -154,6 +155,203 @@ test('late search callbacks cannot restore a condition cleared by collection nav
   assert.equal(enhancements.searchMatchesInput('current', document), false);
   assert.equal(enhancements.searchMatchesInput('', document), true);
   assert.equal(enhancements.searchMatchesInput('anything', { querySelector: () => null }), false);
+});
+
+function searchCipher(id, collectionIds, extra = {}) {
+  return { id, collectionIds, organizationId: 'org', type: 1, ...extra };
+}
+
+function originalSearchFilter(filter) {
+  return (cipher) => (filter.collectionId === undefined ||
+    cipher.collectionIds?.includes(filter.collectionId)) &&
+    (filter.organizationId === undefined || cipher.organizationId === filter.organizationId) &&
+    cipher.otherFiltersMatch !== false;
+}
+
+function recursiveSearchFilter(collections, id, filter = {}) {
+  return enhancements.collectionSearchFilter({ ...filter, collectionId: id },
+    tree(collections.map((c) => ({ ...c }))), originalSearchFilter);
+}
+
+function searchComponent(results, checkInput = () => {}, failed = []) {
+  return {
+    cipherService: { failedToDecryptCiphers$: (userId) => {
+      assert.equal(userId, 'search-user');
+      return failed;
+    } },
+    searchService: {
+      isSearchable: async (text) => !!text?.trim(),
+      searchCiphers: async (userId, organizationId, text, candidates) => {
+        assert.equal(userId, 'search-user');
+        assert.equal(organizationId, null);
+        checkInput(candidates, text);
+        return results;
+      },
+    },
+  };
+}
+
+test('collection search includes every descendant depth but not siblings, parents or similar prefixes', () => {
+  const collections = [collection('parent', 'A'), collection('selected', 'A/B'),
+    collection('child', 'A/B/C'), collection('deep', 'A/B/C/D'),
+    collection('sibling', 'A/E'), collection('prefix', 'A/BB/C'),
+    collection('foreign', 'A/B/C', { organizationId: 'other-org' })];
+  const predicate = recursiveSearchFilter(collections, 'selected');
+  const ciphers = collections.map((c) => searchCipher(c.id, [c.id], { organizationId: c.organizationId }));
+  assert.deepEqual(ciphers.filter(predicate).map((c) => c.id), ['selected', 'child', 'deep']);
+  assert.equal(predicate(searchCipher('mismatched-org', ['child'], { organizationId: 'other-org' })), false);
+  assert.equal(predicate(searchCipher('personal', ['child'], { organizationId: null })), false);
+  assert.equal(predicate(searchCipher('none', null)), false);
+  assert.equal(predicate(searchCipher('none', [])), false);
+  assert.deepEqual(collections.map((c) => c.name), ['A', 'A/B', 'A/B/C', 'A/B/C/D', 'A/E', 'A/BB/C', 'A/B/C']);
+});
+
+test('collection search never infers a grant from parent access or a cipher collection name', () => {
+  const predicate = recursiveSearchFilter([collection('parent', 'A'),
+    collection('child', 'A/Allowed')], 'parent');
+  assert.equal(predicate(searchCipher('parent-item', ['parent'])), true);
+  assert.equal(predicate(searchCipher('child-item', ['child'])), true);
+  assert.equal(predicate(searchCipher('invisible-child-item', ['invisible-child'], { name: 'A/Secret' })), false);
+  assert.equal(predicate(searchCipher('outside', ['sibling'])), false);
+});
+
+test('child-only access can search structural ancestors without gaining real ancestor items', () => {
+  const nodes = tree([collection('leaf', 'A/B/C')]);
+  for (const structural of [nodes[0], nodes[0].children[0]]) {
+    const predicate = enhancements.collectionSearchFilter({ collectionId: structural.node.id },
+      nodes, originalSearchFilter);
+    assert.equal(predicate(searchCipher('visible', ['leaf'])), true);
+    assert.equal(predicate(searchCipher('hidden-root', ['actual-A'])), false);
+    assert.equal(predicate(searchCipher('hidden-parent', ['actual-B'])), false);
+    assert.equal(predicate(searchCipher('virtual', [structural.node.id])), false);
+    assert.equal(predicate(searchCipher('hidden-sibling', ['ungranted-leaf'])), false);
+  }
+});
+
+test('missing, revoked and forged search scopes fail closed instead of searching the whole vault', () => {
+  const child = collection('child', 'A/B');
+  for (const selected of ['revoked-parent', 'missing', 'vw-ancestor:org:A%2FHidden', 'vw-ancestor:other:A']) {
+    assert.equal(recursiveSearchFilter([child], selected)(searchCipher('visible', ['child'])), false);
+  }
+  assert.equal(enhancements.collectionSearchFilter({ collectionId: 'child' }, undefined,
+    originalSearchFilter)(searchCipher('old-snapshot', ['child'])), false);
+  const before = recursiveSearchFilter([collection('parent', 'A'), child], 'parent');
+  const after = recursiveSearchFilter([collection('parent', 'A')], 'parent');
+  assert.equal(before(searchCipher('old-child', ['child'])), true);
+  assert.equal(after(searchCipher('old-child', ['child'])), false);
+  assert.equal(after(searchCipher('parent-item', ['parent'])), true);
+});
+
+test('search scope is rebuilt for each account, permission snapshot and collection move', () => {
+  const first = recursiveSearchFilter([collection('root', 'A'), collection('child', 'A/B')], 'root');
+  const second = recursiveSearchFilter([collection('root', 'A')], 'root');
+  const moved = recursiveSearchFilter([collection('root', 'A'), collection('child', 'Elsewhere/B')], 'root');
+  const item = searchCipher('child-item', ['child']);
+  assert.equal(first(item), true);
+  assert.equal(second(item), false);
+  assert.equal(moved(item), false);
+  const otherOrg = recursiveSearchFilter([collection('root', 'A', { organizationId: 'other' }),
+    collection('child', 'A/B', { organizationId: 'other' })], 'root');
+  assert.equal(otherOrg(item), false);
+});
+
+test('duplicate paths retain distinct root IDs while exact-path descendants remain searchable', () => {
+  const predicate = recursiveSearchFilter([collection('one', 'A/B'), collection('two', 'A/B'),
+    collection('child', 'A/B/C')], 'two');
+  assert.equal(predicate(searchCipher('one-item', ['one'])), false);
+  assert.equal(predicate(searchCipher('two-item', ['two'])), true);
+  assert.equal(predicate(searchCipher('child-item', ['child'])), true);
+});
+
+test('search hierarchy matches the displayed slash trimming but never case-folds or normalizes paths', () => {
+  const collections = [collection('root', '/Caf\u00e9/'), collection('child', '/Caf\u00e9/密码/深层/'),
+    collection('case', 'CAF\u00c9/密码'), collection('unicode', 'Cafe\u0301/密码'),
+    collection('similar', 'Caf\u00e9店/密码')];
+  const predicate = recursiveSearchFilter(collections, 'root');
+  assert.deepEqual(collections.map((c) => searchCipher(c.id, [c.id])).filter(predicate).map((c) => c.id),
+    ['root', 'child']);
+});
+
+test('failed collection-name decryption permits direct search but cannot invent descendant paths', () => {
+  const failed = collection('failed', 'Unknown', { decryptionFailure: true });
+  const predicate = recursiveSearchFilter([failed, collection('apparent-child', 'Unknown/Child')], 'failed');
+  assert.equal(predicate(searchCipher('direct', ['failed'])), true);
+  assert.equal(predicate(searchCipher('not-a-known-descendant', ['apparent-child'])), false);
+  const root = recursiveSearchFilter([collection('root', 'A'),
+    collection('failed-child', 'A/Unknown', { decryptionFailure: true })], 'root');
+  assert.equal(root(searchCipher('failed-child-item', ['failed-child'])), false);
+});
+
+test('all, unassigned and non-collection search preserve the original predicate unchanged', () => {
+  for (const collectionId of [undefined, 'all', 'unassigned']) {
+    const filter = { collectionId, type: 'login', folderId: 'folder' };
+    const sentinel = () => 'original-result';
+    const predicate = enhancements.collectionSearchFilter(filter, undefined, (received) => {
+      assert.equal(received, filter);
+      return sentinel;
+    });
+    assert.equal(predicate, sentinel);
+  }
+});
+
+test('recursive collection search delegates every other filter to the unmodified upstream factory', () => {
+  const filter = { collectionId: 'parent', organizationId: 'org', type: 'favorites',
+    folderId: 'folder', organizationIdParamType: 'path' };
+  const nodes = tree([collection('parent', 'A'), collection('child', 'A/B')]);
+  const predicate = enhancements.collectionSearchFilter(filter, nodes, (received) => {
+    assert.deepEqual(received, { ...filter, collectionId: undefined });
+    return (cipher) => cipher.otherFiltersMatch;
+  });
+  assert.equal(predicate(searchCipher('allowed', ['child'], { otherFiltersMatch: true })), true);
+  assert.equal(predicate(searchCipher('excluded', ['child'], { otherFiltersMatch: false })), false);
+  assert.equal(filter.collectionId, 'parent');
+  assert.equal(recursiveSearchFilter([collection('parent', 'A'), collection('child', 'A/B')],
+    'parent', { organizationId: 'another-org' })(searchCipher('wrong-org', ['child'])), false);
+});
+
+test('basic and advanced collection searches keep the full authorized input and reject extraneous results', async () => {
+  const nodes = tree([collection('parent', 'A'), collection('child', 'A/B'),
+    collection('sibling', 'Other')]);
+  const parent = searchCipher('parent-item', ['parent']);
+  const child = searchCipher('child-item', ['parent', 'child']);
+  const sibling = searchCipher('sibling-item', ['sibling']);
+  const unauthorized = searchCipher('not-in-authorized-feed', ['child']);
+  const all = [parent, child, sibling];
+  for (const query of ['demo', '>name:demo']) {
+    const component = searchComponent([child, sibling, unauthorized, { ...child }, parent],
+      (candidates, text) => {
+        assert.deepEqual(candidates, all);
+        assert.equal(text, query);
+      });
+    const result = await enhancements.searchVaultCiphers(component, 'search-user', all,
+      { collectionId: 'parent' }, query, nodes, originalSearchFilter, async (value) => value);
+    assert.deepEqual(result, [child, parent]);
+    assert.equal(result.filter((c) => c.id === child.id).length, 1);
+  }
+});
+
+test('empty, whitespace and non-searchable queries retain direct-only collection browsing', async () => {
+  const nodes = tree([collection('parent', 'A'), collection('child', 'A/B')]);
+  const parent = searchCipher('parent-item', ['parent']);
+  const child = searchCipher('child-item', ['child']);
+  const component = searchComponent([], () => assert.fail('search must not run'));
+  component.searchService.isSearchable = async () => false;
+  for (const query of [undefined, '', '   ', 'x']) {
+    assert.deepEqual(await enhancements.searchVaultCiphers(component, 'search-user', [parent, child],
+      { collectionId: 'parent' }, query, nodes, originalSearchFilter, async (value) => value), [parent]);
+  }
+});
+
+test('authorized failed-decryption rows are retained without accepting rows outside either account feed', async () => {
+  const nodes = tree([collection('parent', 'A'), collection('child', 'A/B')]);
+  const failed = searchCipher('failed', ['child']);
+  const good = searchCipher('good', ['child']);
+  const hidden = searchCipher('hidden', ['child']);
+  const component = searchComponent([failed, good, hidden], (candidates) => {
+    assert.deepEqual(candidates, [failed, good]);
+  }, [failed]);
+  assert.deepEqual(await enhancements.searchVaultCiphers(component, 'search-user', [good],
+    { collectionId: 'parent' }, 'demo', nodes, originalSearchFilter, async (value) => value), [failed, good]);
 });
 
 test('permission selector retains missing intermediate ancestors without inventing write targets', () => {

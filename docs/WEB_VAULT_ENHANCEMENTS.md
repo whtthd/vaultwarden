@@ -17,6 +17,21 @@ For Chinese usage instructions and permission cautions, see
 - Selecting a collection, folder, organization or item type clears the previous
   text search. Following a collection from search results also clears it. A
   pending search debounce cannot restore text cleared by navigation.
+- A searchable query inside a collection includes that collection and its
+  descendants at every depth, intersected with the current account's authorized
+  cipher snapshot. The scope comes only from that account's decrypted collection
+  tree, never from the admin catalog or a new server-side search. Empty or
+  non-searchable queries retain direct-only browsing. All other upstream filter
+  conditions still apply. Structural parents include accessible descendants
+  without granting access to the real parents; path-segment and organization
+  boundaries prevent sibling, similar-prefix and cross-organization matches.
+  Missing selections fail closed. Collection/cipher updates recompute the scope,
+  switchMap discards superseded asynchronous results, and an active-account
+  guard clears results when the view's original account is no longer active.
+  No collection scope is cached between accounts or queries. Both basic and
+  advanced search retain the complete authorized input snapshot, avoiding a
+  stale per-account advanced-search index after switching collection scopes;
+  returned results are intersected with the same snapshot before scope filtering.
 - The collection access tab has a descendant tree. Select all, select a branch,
   clear the selection or choose individual descendants. Only access changes made
   in the current edit propagate to selected descendants. Unrelated member and
@@ -202,9 +217,16 @@ Member-editor tests cover hierarchy and duplicate IDs, missing ancestors,
 readonly/group-derived rows, filtered operation boundaries, all permission modes,
 independent grant preservation, selection clearing, CVA notifications and
 subscription cleanup.
+Recursive-search tests cover deep descendants, structural parents, exact path
+and organization boundaries, duplicate paths, Unicode/case-sensitive hierarchy,
+unauthorized candidates, multi-collection membership, failed name decryption,
+revoked/missing scopes, account isolation, unchanged non-collection filters and
+direct-only browsing without a searchable query. Basic and advanced queries use
+the same authorized candidate set; forged or stale search results are rejected.
 Preparation tests
 cover every pinned hook, both collection terminology modes, idempotence, resource
-cache busting, upgrade from the earlier local patch and exact restoration.
+cache busting, reactive descendant-search wiring, upgrade from the earlier local
+patch and exact restoration.
 
 ### Parent/Child Permission Regression
 

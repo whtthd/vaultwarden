@@ -94,6 +94,17 @@ ENHANCEMENT_PATCHES = [
         '.subscribe(e=>window.VaultwardenEnhancements.searchMatchesInput(e)&&'
         'this.router.navigate([],{queryParams:{search:Ui.A.isNullOrEmpty(e)?null:e}',
     ),
+    (
+        'a=(0,Ke.z)([o,i,this.currentSearchText$]).pipe((0,h.p)(([e,t])=>null!=e&&null!=t),'
+        '(0,Sl.H)(t=>RG(this,[t],void 0,function*([t,i,n]){var r;'
+        'const s=null!==(r=yield(0,u._)(this.cipherService.failedToDecryptCiphers$(e)))&&void 0!==r?r:[],'
+        'o=(0,Bh.Jpj)(i),a=[...s,...t];if(yield this.searchService.isSearchable(n)){'
+        'return(yield this.searchService.searchCiphers(e,null,n,a)).filter(o)}return a.filter(o)}))',
+        'a=(0,Ke.z)([o,i,this.currentSearchText$,r,this.accountService.activeAccount$]).pipe('
+        '(0,h.p)(([e,t])=>null!=e&&null!=t),'
+        '(0,Le.n)(([t,i,n,r,s])=>null!=s&&s.id===e?'
+        'window.VaultwardenEnhancements.searchVaultCiphers(this,e,t,i,n,r,Bh.Jpj,u._):Promise.resolve([]))',
+    ),
 ]
 
 

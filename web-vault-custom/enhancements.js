@@ -340,6 +340,47 @@
     return !!input && input.value === (value ?? "");
   }
 
+  function collectionSearchFilter(filter, collectionTree, makeFilter) {
+    if (filter.collectionId === undefined || filter.collectionId === "all" ||
+        filter.collectionId === "unassigned") return makeFilter(filter);
+
+    const collections = [];
+    const pending = [...(collectionTree ?? [])];
+    while (pending.length) {
+      const node = pending.pop();
+      collections.push(node.node);
+      pending.push(...node.children);
+    }
+    const matches = collections.filter((c) => c.id === filter.collectionId);
+    // A missing/revoked selection must never fall back to searching the entire vault.
+    if (matches.length !== 1 || !matches[0].organizationId) return () => false;
+    const selected = matches[0];
+    const path = selected.decryptionFailure ? undefined : selected.fullName;
+    const ids = new Set(collections.filter((c) =>
+      !c.vwStructuralOnly && typeof c.id === "string" && !c.id.startsWith(structuralPrefix) &&
+      c.organizationId === selected.organizationId &&
+      (c.id === selected.id || (!c.decryptionFailure && typeof path === "string" &&
+        path.length > 0 && c.fullName?.startsWith(path + "/")))).map((c) => c.id));
+    const otherFilters = makeFilter({ ...filter, collectionId: undefined });
+    return (cipher) => cipher.organizationId === selected.organizationId &&
+      Array.isArray(cipher.collectionIds) && cipher.collectionIds.some((id) => ids.has(id)) &&
+      otherFilters(cipher);
+  }
+
+  async function searchVaultCiphers(component, userId, ciphers, filter, text, collectionTree,
+    makeFilter, firstValueFrom) {
+    const failed = await firstValueFrom(component.cipherService.failedToDecryptCiphers$(userId)) ?? [];
+    const all = [...failed, ...ciphers];
+    if (!await component.searchService.isSearchable(text)) return all.filter(makeFilter(filter));
+
+    const predicate = collectionSearchFilter(filter, collectionTree, makeFilter);
+    // Keep the complete authorized snapshot as input: the upstream advanced-search index is
+    // cached per account, not per collection. Subset indexing could leave other scopes stale.
+    const candidates = new Set(all);
+    const results = await component.searchService.searchCiphers(userId, null, text, all);
+    return results.filter((cipher) => candidates.has(cipher) && predicate(cipher));
+  }
+
   function descendantRows(original, descendants) {
     const rows = new Map();
     const duplicates = [];
@@ -1152,7 +1193,8 @@
   return { start, registerScrollHost, unregisterScrollHost, registerCollectionDialog,
     saveCollection, createCollection, collectionPathError, nestedCollectionTraverse,
     planCollectionUpdate, accessDelta, applyDelta, isDescendant, navigationKey,
-    searchMatchesInput, descendantRows, selectionState, toggleSelection, revocationCandidates,
+    searchMatchesInput, collectionSearchFilter, searchVaultCiphers,
+    descendantRows, selectionState, toggleSelection, revocationCandidates,
     cloneSourceWithoutItemAccess, itemGrants, saveItemAccess,
     memberCollectionRows, planMemberCollectionAccess, applyMemberCollectionAccess,
     registerMemberCollectionSelector, unregisterMemberCollectionSelector,
