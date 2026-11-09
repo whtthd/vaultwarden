@@ -26,3 +26,7 @@ extend-ignore-re = [
     # Ignore Punycode/IDN tests
     "xn--.+"
 ]
+
+[default.extend-identifiers]
+# Exact identifier in the pinned upstream web-vault bundle; it must not be renamed.
+Ue = "Ue"

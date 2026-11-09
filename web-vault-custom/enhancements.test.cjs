@@ -264,9 +264,9 @@ test('duplicate paths retain distinct root IDs while exact-path descendants rema
 });
 
 test('search hierarchy matches the displayed slash trimming but never case-folds or normalizes paths', () => {
-  const collections = [collection('root', '/Caf\u00e9/'), collection('child', '/Caf\u00e9/密码/深层/'),
-    collection('case', 'CAF\u00c9/密码'), collection('unicode', 'Cafe\u0301/密码'),
-    collection('similar', 'Caf\u00e9店/密码')];
+  const collections = [collection('root', '/Café/'), collection('child', '/Café/密码/深层/'),
+    collection('case', 'CAFÉ/密码'), collection('unicode', 'Cafe\u0301/密码'),
+    collection('similar', 'Café店/密码')];
   const predicate = recursiveSearchFilter(collections, 'root');
   assert.deepEqual(collections.map((c) => searchCipher(c.id, [c.id])).filter(predicate).map((c) => c.id),
     ['root', 'child']);
@@ -424,9 +424,9 @@ test('blank segments and invisible boundary spaces are rejected without rewritin
 });
 
 test('visually equivalent existing paths are detected without changing their stored names', () => {
-  const legacy = collection('legacy', ' A /Caf\u0065\u0301 ');
-  assert.match(enhancements.collectionPathError(collection(undefined, 'A/Caf\u00e9'), [legacy]), /同名/);
-  assert.equal(legacy.name, ' A /Caf\u0065\u0301 ');
+  const legacy = collection('legacy', ' A /Cafe\u0301 ');
+  assert.match(enhancements.collectionPathError(collection(undefined, 'A/Café'), [legacy]), /同名/);
+  assert.equal(legacy.name, ' A /Cafe\u0301 ');
   assert.equal(enhancements.collectionPathError(collection(undefined, 'A/B'),
     [collection('structure', 'A/B', { vwStructuralOnly: true })]), null);
 });
