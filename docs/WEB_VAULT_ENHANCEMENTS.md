@@ -20,14 +20,14 @@ For Chinese usage instructions and permission cautions, see
   Its collection search includes descendant paths only after intersecting the
   current organization cipher snapshot; the admin collection catalog cannot grant
   a cipher that the account cannot already read.
-- Admin Console member and group tables use the CDK viewport as their own scroll
-  host. Their search/header controls and the member status filter remain visible
-  while rows scroll. Switching organization or management pages clears stale list
-  searches, while changing only the search text does not clear the active query.
+- Admin Console member and group tables retain the original main/CDK scroll
+  host, with their header/search and member status controls pinned above the rows.
+  Changing search resets the list scroll; switching organization or member status
+  clears stale text. New pages retain their own explicitly linked search query.
 - Selecting a collection, folder, organization or item type clears the previous
   text search. Following a collection from search results also clears it. A
   pending search debounce cannot restore text cleared by navigation.
-- A searchable query inside a collection includes that collection and its
+- A searchable query inside a personal-vault collection includes that collection and its
   descendants at every depth, intersected with the current account's authorized
   cipher snapshot. The scope comes only from that account's decrypted collection
   tree, never from the admin catalog or a new server-side search. Empty or
@@ -42,6 +42,11 @@ For Chinese usage instructions and permission cautions, see
   advanced search retain the complete authorized input snapshot, avoiding a
   stale per-account advanced-search index after switching collection scopes;
   returned results are intersected with the same snapshot before scope filtering.
+- Organization-vault search consumes the decrypted nested collection snapshot,
+  including structural ancestors. Restricted parents contribute accessible
+  descendants only, not direct parent items. A switchMap projection rejects
+  superseded results and guards the original account; the pinned integration
+  test executes that actual projection with the upstream filter factory.
 - The collection access tab has a descendant tree. Select all, select a branch,
   clear the selection or choose individual descendants. Only access changes made
   in the current edit propagate to selected descendants. Unrelated member and

@@ -85,6 +85,18 @@ class PreparationTests(unittest.TestCase):
         main = (self.root / 'web-vault/app').glob('main.*.vaultwarden.js')
         main_bytes = next(main).read_bytes()
         self.assertIn(generated_name.split('.')[1].encode(), main_bytes)
+        self.assertIn(b'this.collectionService.nestedCollections$,this.accountService.activeAccount$', patched)
+        self.assertIn(b'this.vwSearchUserId$', patched)
+        self.assertIn(b'(0,m.n)(([e,t,i,n,o,s,r,a,l])=>', patched)
+        self.assertIn(b'this.router.navigate([],{queryParams:{search:Mt.A.', patched)
+        self.assertIn(b'.subscribe(e=>window.VaultwardenEnhancements.searchMatchesInput(e)&&', patched)
+
+    def test_modified_lazy_chunk_fails_without_updating_index(self):
+        asset = next(iter(ORIGINAL_LAZY_ASSETS))
+        (self.root / 'web-vault' / asset).write_bytes(b'unsupported')
+        with self.assertRaisesRegex(ValueError, 'lazy chunk differs'):
+            self.prepare()
+        self.assertEqual(self.index.read_bytes(), self.original_index)
 
     def test_prepare_is_idempotent_and_restore_is_exact(self):
         self.prepare(local_dev=True)
@@ -206,6 +218,77 @@ async function search(filter = {}, account = { id: 'active-user' }, tree = nodes
         result = subprocess.run(
             ['node', '-e', script], input=payload, text=True, capture_output=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+
+    @unittest.skipUnless(shutil.which('node'), 'Node.js is needed for pinned admin search integration')
+    def test_actual_admin_projection_passes_filter_factory_and_guards_accounts(self):
+        asset = next(iter(ORIGINAL_LAZY_ASSETS))
+        patched = patch_lazy_bundle((ROOT / 'web-vault' / asset).read_bytes(), asset)
+        projection = re.findall(
+            rb'\(0,m\.n\)\((\(\[e,t,i,n,o,s,r,a,l\]\)=>.*?:Promise.resolve\(\[\]\))\)', patched)
+        self.assertEqual(len(projection), 1)
+        start = self.bundle.index(b'function Ib(e){')
+        end = self.bundle.index(b'const Bb=', start)
+        payload = json.dumps({
+            'factory': self.bundle[start:end].decode(),
+            'projection': projection[0].decode(),
+            'runtime': str(ROOT / 'web-vault-custom/enhancements.js'),
+        })
+        script = r"""
+const fs = require('node:fs'), vm = require('node:vm'), assert = require('node:assert/strict');
+const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+const makeFilter = vm.runInNewContext('(' + input.factory + ')', {
+  k: { n: { getType: c => c.type, isDeleted: c => !!c.deleted, isArchived: c => !!c.archived } },
+  Bt: { gC: { Login: 1, SecureNote: 2, Card: 3, Identity: 4, SshKey: 5,
+    BankAccount: 6, DriversLicense: 7, Passport: 8 } },
+  dn: { I_: 'unassigned' }, ly: 'all',
+});
+let searches = 0;
+const component = { searchService: {
+  isSearchable: async text => !!text?.trim(),
+  searchCiphers: async (user, org, text, candidates) => {
+    searches++;
+    assert.equal(user, 'user');
+    assert.equal(org, 'org');
+    return [...candidates, { ...candidates[0] }];
+  },
+} };
+const project = vm.runInNewContext('(function(){return ' + input.projection + ';})', {
+  window: { VaultwardenEnhancements: require(input.runtime) }, d: { Jpj: makeFilter },
+}).call(component);
+const node = (id, fullName, children = []) =>
+  ({ node: { id, fullName, organizationId: 'org' }, children });
+const nodes = [node('parent', 'A', [node('child', 'A/B')])];
+const item = (id, collectionIds, extra = {}) =>
+  ({ id, collectionIds, organizationId: 'org', type: 1, ...extra });
+const parent = item('parent-item', ['parent']);
+const child = item('child-item', ['child']);
+const note = item('note', ['child'], { type: 2 });
+const ciphers = [parent, child, note, item('sibling', ['outside']),
+  item('foreign', ['child'], { organizationId: 'foreign' })];
+async function search({ filter = {}, text = 'demo', restricted = false,
+  account = { id: 'user' }, originalUser = 'user', user = 'user', collections = nodes } = {}) {
+  return Array.from(await project([ciphers, { organizationId: 'org', collectionId: 'parent', ...filter },
+    text, restricted, user, 'org', collections, account, originalUser]), c => c.id);
+}
+(async () => {
+  assert.deepEqual(await search({ text: '' }), ['parent-item']);
+  assert.deepEqual(await search(), ['parent-item', 'child-item', 'note']);
+  assert.deepEqual(await search({ filter: { type: 'login' } }), ['parent-item', 'child-item']);
+  assert.deepEqual(await search({ restricted: true }), ['child-item', 'note']);
+  assert.deepEqual(await search({ restricted: true, text: '' }), []);
+  assert.deepEqual(await search({ filter: { collectionId: 'missing' } }), []);
+  assert.deepEqual(await search({ collections: [] }), []);
+  assert.deepEqual(await search({ filter: { organizationId: 'foreign' } }), []);
+  const before = searches;
+  assert.deepEqual(await search({ account: null }), []);
+  assert.deepEqual(await search({ account: { id: 'other' } }), []);
+  assert.deepEqual(await search({ account: { id: 'other' }, user: 'other' }), []);
+  assert.equal(searches, before);
+})().catch(error => { console.error(error); process.exitCode = 1; });
+"""
+        result = subprocess.run(
+            ['node', '-e', script], input=payload, text=True, capture_output=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr[-3000:])
 
     def test_resources_get_new_urls_when_changed(self):
         self.prepare()

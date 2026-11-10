@@ -5,34 +5,23 @@ main#main-content.vw-vault-layout {
   overflow: hidden;
   min-height: 0;
 }
-/* Admin tables keep their header and filters outside the CDK viewport. */
-main#main-content.vw-admin-list-layout {
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-  overflow: hidden;
-}
-main#main-content.vw-admin-list-layout .vw-admin-list-header {
+/* Keep the original CDK/main scroll host; routed page hosts must bound sticky controls. */
+.vw-admin-list-content { display: block; min-width: 0; }
+main#main-content.vw-admin-list-page .vw-admin-list-header {
   background: var(--color-bg-primary);
+  display: block;
   position: sticky;
   top: 0;
   z-index: 8;
 }
-main#main-content.vw-admin-list-layout .vw-admin-list-controls {
+main#main-content.vw-admin-list-page .vw-admin-list-controls {
   background: var(--color-bg-primary);
   position: sticky;
   top: var(--vw-admin-header-height, 4rem);
   z-index: 7;
 }
-main#main-content.vw-admin-list-layout .vw-admin-list-viewport {
-  flex: 1 1 0;
-  min-height: 0;
-  overscroll-behavior-y: contain;
-  scrollbar-gutter: stable;
-}
-main#main-content.vw-admin-list-layout .vw-admin-list-viewport:focus-visible {
-  outline: 2px solid currentColor;
-  outline-offset: -2px;
+main#main-content.vw-admin-list-page {
+  scroll-padding-block-start: calc(var(--vw-admin-header-height, 4rem) + 4rem);
 }
 .vw-vault {
   display: flex;

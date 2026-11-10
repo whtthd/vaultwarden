@@ -19,8 +19,69 @@ test('filter title and search area use the left pane sticky layout', () => {
   assert.match(css, /\.vw-filter-pane app-vault-filter \[data-testid="filters-body"\] > \.tw-mb-4[\s\S]*position:\s*sticky/);
   assert.match(css, /top:\s*var\(--vw-filter-header-height/);
   assert.match(css, /background:\s*var\(--color-bg-primary\)/);
-  assert.match(css, /main#main-content\.vw-admin-list-layout/);
-  assert.match(css, /\.vw-admin-list-viewport/);
+  assert.match(css, /main#main-content\.vw-admin-list-page \.vw-admin-list-header/);
+  assert.match(css, /\.vw-admin-list-content \{ display: block/);
+  assert.doesNotMatch(css, /\.vw-admin-list-layout|\.vw-admin-list-viewport/);
+});
+
+test('admin list controls stay on the routed host without redirecting the CDK scroll reference', () => {
+  const fs = require('node:fs'), path = require('node:path'), vm = require('node:vm');
+  const instance = { exports: {} };
+  vm.runInNewContext(fs.readFileSync(path.join(__dirname, 'enhancements.js'), 'utf8'),
+    { module: instance, URLSearchParams });
+  const runtime = instance.exports;
+  const classes = () => {
+    const values = new Set();
+    return { add: (...names) => names.forEach((name) => values.add(name)),
+      remove: (name) => values.delete(name), contains: (name) => values.has(name) };
+  };
+  const callbacks = {}, frames = [], timers = [], events = [];
+  let onList = true;
+  const status = { classList: classes(), matches: () => false, querySelector: () => ({}) };
+  const viewport = { matches: () => false, querySelector: () => null };
+  const header = { classList: classes(), querySelector: () => ({}),
+    getBoundingClientRect: () => ({ height: 92 }) };
+  const page = { classList: classes(), children: [header, status, viewport],
+    querySelector: () => viewport };
+  header.parentElement = page;
+  const main = { classList: classes(), scrollTop: 800,
+    style: { setProperty() {} }, contains: () => true,
+    querySelector: () => null, querySelectorAll: () => onList ? [header] : [],
+    dispatchEvent: (event) => events.push(event.type) };
+  const search = { value: 'old query', closest: () => main, matches: () => true,
+    dispatchEvent: (event) => events.push(event.type) };
+  const document = { documentElement: {}, querySelector: (selector) =>
+    selector === 'main#main-content' ? main : null,
+    querySelectorAll: () => [search],
+    addEventListener: (name, callback) => { callbacks[name] = callback; } };
+  main.ownerDocument = document;
+  const windowObject = { document, location: { hash: '#/organizations/org/members' },
+    MutationObserver: class { observe() {} }, requestAnimationFrame: (callback) => frames.push(callback),
+    setTimeout: (callback) => timers.push(callback), addEventListener: (name, cb) => { callbacks[name] = cb; },
+    Event: class { constructor(type) { this.type = type; } } };
+  let reference = { nativeElement: main };
+  const original = reference;
+  const signal = () => reference;
+  signal.set = (next) => { reference = next; };
+  const host = { ref: original, service: { scrollableRef: signal } };
+  runtime.start(windowObject);
+  runtime.registerScrollHost(host);
+  frames.shift()();
+  assert.equal(reference, original);
+  assert.equal(page.classList.contains('vw-admin-list-content'), true);
+  assert.equal(header.classList.contains('vw-admin-list-header'), true);
+  assert.equal(status.classList.contains('vw-admin-list-controls'), true);
+  callbacks.input({ target: search });
+  assert.equal(main.scrollTop, 0);
+  assert.deepEqual(events, ['scroll']);
+  onList = false;
+  windowObject.location.hash = '#/organizations/org/settings';
+  callbacks.hashchange();
+  frames.shift()();
+  assert.equal(reference, original);
+  assert.equal(main.classList.contains('vw-admin-list-page'), false);
+  assert.equal(page.classList.contains('vw-admin-list-content'), false);
+  runtime.unregisterScrollHost(host);
 });
 
 function collection(id, name, extra = {}) {
@@ -331,14 +392,13 @@ test('admin collection search accepts a flat catalog while remaining inside the 
     searchCipher('sibling-item', ['sibling']),
   ];
   const component = {
-    allCollections$: [parent, child, sibling],
     searchService: {
       isSearchable: async () => true,
       searchCiphers: async (user, org, text, candidates) => {
         assert.equal(user, 'admin-user');
         assert.equal(org, 'org');
         assert.equal(text, 'secret');
-        return [...candidates, searchCipher('forged', ['child'])];
+        return [...candidates, { ...candidates[1] }, searchCipher('forged', ['child'])];
       },
     },
   };
@@ -347,14 +407,14 @@ test('admin collection search accepts a flat catalog while remaining inside the 
     cipher.organizationId === 'org';
   const result = await enhancements.searchOrganizationVaultCiphers(
     component, 'admin-user', 'org', authorized,
-    { collectionId: 'parent' }, 'secret', makeFilter, async (value) => value,
+    { collectionId: 'parent', organizationId: 'org' }, 'secret', [parent, child, sibling],
+    false, makeFilter,
   );
   assert.deepEqual(result.map((cipher) => cipher.id), ['parent-item', 'child-item']);
 });
 
 test('admin collection search fails closed when its collection snapshot is unavailable', async () => {
   const component = {
-    allCollections$: { subscribe() { throw new Error('unavailable'); } },
     searchService: {
       isSearchable: async () => true,
       searchCiphers: async () => [searchCipher('visible', ['child'])],
@@ -362,11 +422,50 @@ test('admin collection search fails closed when its collection snapshot is unava
   };
   const result = await enhancements.searchOrganizationVaultCiphers(
     component, 'admin-user', 'org', [searchCipher('visible', ['child'])],
-    { collectionId: 'parent' }, 'secret', () => () => true, async () => {
-      throw new Error('unavailable');
-    },
+    { collectionId: 'parent', organizationId: 'org' }, 'secret', undefined,
+    false, () => () => true,
   );
   assert.deepEqual(result, []);
+});
+
+test('admin search retains direct browsing without a searchable query and blocks restricted parents', async () => {
+  const models = tree([collection('parent', 'A'), collection('child', 'A/B')]);
+  const parent = searchCipher('parent-item', ['parent']);
+  const child = searchCipher('child-item', ['child']);
+  const component = { searchService: {
+    isSearchable: async (text) => !!text,
+    searchCiphers: async (user, org, text, ciphers) => ciphers,
+  } };
+  async function search(text, restricted, filter = {}) {
+    return enhancements.searchOrganizationVaultCiphers(component, 'user', 'org', [parent, child],
+      { collectionId: 'parent', organizationId: 'org', ...filter }, text, models,
+      restricted, originalSearchFilter);
+  }
+  assert.deepEqual(await search('', false), [parent]);
+  assert.deepEqual(await search('', true), []);
+  assert.deepEqual(await search('match', false), [parent, child]);
+  assert.deepEqual(await search('match', true), [child]);
+  assert.deepEqual(await search('match', false, { organizationId: 'foreign' }), []);
+  assert.deepEqual(await search('match', false, { collectionId: undefined }), []);
+  assert.deepEqual(await search('match', true, { collectionId: undefined, type: 'all' }), []);
+});
+
+test('admin scopes do not index cross-organization records or return stale cipher instances', async () => {
+  const root = collection('parent', 'A'), child = collection('child', 'A/B');
+  const allowed = searchCipher('allowed', ['child']);
+  const foreign = searchCipher('foreign', ['child'], { organizationId: 'foreign' });
+  const component = { searchService: {
+    isSearchable: async () => true,
+    searchCiphers: async (user, org, text, ciphers) => {
+      assert.deepEqual(ciphers, [allowed]);
+      return [foreign, { ...allowed }, allowed];
+    },
+  } };
+  const result = await enhancements.searchOrganizationVaultCiphers(
+    component, 'user', 'org', [allowed, foreign],
+    { collectionId: 'parent', organizationId: 'org' }, 'match', [root, child],
+    false, originalSearchFilter);
+  assert.deepEqual(result, [allowed]);
 });
 
 test('basic and advanced collection searches keep the full authorized input and reject extraneous results', async () => {
@@ -443,7 +542,7 @@ test('a collection whose access was revoked is not reinserted by the dialog call
 test('clearing a search is deferred until the collection click handler has run', () => {
   const callbacks = {}, timers = [], events = [];
   const input = { value: 'pending search', dispatchEvent: (event) => events.push(event.type) };
-  class FakeElement { closest() { return this; } }
+  class FakeElement { closest(selector) { return selector.includes('filter-button') ? this : null; } }
   const document = {
     documentElement: {}, addEventListener: (name, callback) => { callbacks[name] = callback; },
     querySelector: () => input,

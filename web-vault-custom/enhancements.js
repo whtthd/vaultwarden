@@ -19,7 +19,6 @@
   let scheduled = false;
   let layout;
   let adminListLayout;
-  let adminListRouteKey;
   let memberSelectorId = 0;
 
   function copy(model) {
@@ -338,12 +337,7 @@
   }
 
   function adminListKey(hash) {
-    const [path, query = ""] = hash.split("?");
-    const params = new URLSearchParams(query);
-    const entries = [...params.entries()]
-      .filter(([key]) => key !== "search" && key !== "cipherId" && key !== "itemId" && key !== "action")
-      .sort(([a], [b]) => a.localeCompare(b));
-    return path + "?" + entries.map(([key, value]) => `${key}=${value}`).join("&");
+    return hash.split("?")[0];
   }
 
   function searchInputs(document = win?.document) {
@@ -364,9 +358,13 @@
 
   function collectionModel(node) { return node?.node ?? node; }
   function collectionChildren(node) { return Array.isArray(node?.children) ? node.children : []; }
-  function collectionPath(model) { return model?.decryptionFailure ? undefined : model?.fullName ?? model?.name; }
+  function collectionPath(model) {
+    if (model?.decryptionFailure) return undefined;
+    const path = model?.fullName ?? model?.name;
+    return typeof path === "string" ? path.replace(/^\/+|\/+$/g, "") : undefined;
+  }
 
-  function collectionSearchFilter(filter, collectionTree, makeFilter) {
+  function collectionSearchFilter(filter, collectionTree, makeFilter, excludeSelected = false) {
     if (filter.collectionId === undefined || filter.collectionId === "all" ||
         filter.collectionId === "AllCollections" || filter.collectionId === "unassigned") {
       return makeFilter(filter);
@@ -388,7 +386,7 @@
     const ids = new Set(collections.filter((c) =>
       !c.vwStructuralOnly && typeof c.id === "string" && !c.id.startsWith(structuralPrefix) &&
       c.organizationId === selected.organizationId &&
-      (c.id === selected.id || (typeof path === "string" && path.length > 0 &&
+      ((!excludeSelected && c.id === selected.id) || (typeof path === "string" && path.length > 0 &&
         collectionPath(c)?.startsWith(path + "/")))).map((c) => c.id));
     const otherFilters = makeFilter({ ...filter, collectionId: undefined });
     return (cipher) => cipher.organizationId === selected.organizationId &&
@@ -410,40 +408,22 @@
     return results.filter((cipher) => candidates.has(cipher) && predicate(cipher));
   }
 
-  async function readCollectionSource(source, firstValueFrom) {
-    if (source == null) return [];
-    if (typeof source.subscribe === "function") return firstValueFrom(source);
-    if (typeof source.then === "function") return source;
-    return source;
-  }
-
   async function searchOrganizationVaultCiphers(component, userId, organizationId, ciphers,
-    filter, text, makeFilter, firstValueFrom) {
-    const all = Array.isArray(ciphers) ? ciphers : [];
-    if (!await component.searchService.isSearchable(text)) return all.filter(makeFilter(filter));
-
-    let collections;
-    if (filter.collectionId === undefined || filter.collectionId === "all" ||
-        filter.collectionId === "AllCollections" || filter.collectionId === "unassigned") {
-      collections = undefined;
-    } else {
-      try {
-        collections = await readCollectionSource(component.allCollections$, firstValueFrom);
-      } catch (_) {
-        // An unavailable collection snapshot must never widen a scoped search.
-        return [];
-      }
+    filter, text, collections, restricted, makeFilter) {
+    if (!userId || !organizationId || filter.organizationId !== organizationId ||
+        (filter.collectionId === undefined && filter.type === undefined)) return [];
+    const all = (ciphers ?? []).filter((cipher) => cipher.organizationId === organizationId);
+    if (!await component.searchService.isSearchable(text)) {
+      return restricted ? [] : all.filter(makeFilter(filter));
     }
-    const predicate = collectionSearchFilter(filter, collections, makeFilter);
-    const candidates = new Map(all.map((cipher) => [cipher.id, cipher]));
-    const results = await component.searchService.searchCiphers(
-      userId, organizationId, text, all);
-    const returned = new Set();
-    return results.filter((cipher) => {
-      if (!cipher || !candidates.has(cipher.id) || returned.has(cipher.id)) return false;
-      returned.add(cipher.id);
-      return predicate(cipher);
-    });
+    if (restricted && (filter.collectionId === undefined ||
+        filter.collectionId === "all" || filter.collectionId === "unassigned")) return [];
+    const predicate = collectionSearchFilter(filter, collections, makeFilter, restricted);
+    // The directory defines paths, never access. Intersect with this exact authorized snapshot,
+    // not just IDs that a stale search index could return with different contents or grants.
+    const candidates = new Set(all);
+    const results = await component.searchService.searchCiphers(userId, organizationId, text, all);
+    return results.filter((cipher) => candidates.has(cipher) && predicate(cipher));
   }
 
   function descendantRows(original, descendants) {
@@ -513,6 +493,9 @@
         layout.main.classList.remove("vw-vault-layout");
         layout = undefined;
       }
+      for (const host of scrollHosts) {
+        if (host.vwScrollScope === "vault") restoreScrollHost(host);
+      }
       return;
     }
     const main = vault.closest("main");
@@ -553,66 +536,38 @@
 
   function updateAdminListLayout() {
     const main = win.document.querySelector("main#main-content");
-    if (!main) return;
-    const vault = main.querySelector("app-vault, app-org-vault");
-    const viewport = [...main.querySelectorAll("cdk-virtual-scroll-viewport[bitScrollLayout]")]
-      .find((node) => !node.closest("cdk-dialog-container, dialog"));
-    const adminPage = !vault && main.querySelector("app-header") &&
-      (win.location.hash.includes("/organizations/") || !!viewport);
-    if (!adminPage) {
+    const header = main && !main.querySelector("app-vault, app-org-vault") &&
+      [...main.querySelectorAll("app-header")].find((node) => node.querySelector("bit-search"));
+    const page = header?.parentElement;
+    const isList = page && (page.querySelector("cdk-virtual-scroll-viewport[bitScrollLayout]") ||
+      /#\/organizations\/[^/]+\/(?:members|groups)(?:[/?]|$)/.test(win.location.hash));
+    if (!isList || !win.location.hash.includes("/organizations/")) {
       if (adminListLayout) {
-        adminListLayout.main.classList.remove("vw-admin-list-layout");
         adminListLayout.main.classList.remove("vw-admin-list-page");
-        adminListLayout.headers.forEach((header) =>
-          header.classList.remove("vw-admin-list-header"));
+        adminListLayout.page.classList.remove("vw-admin-list-content");
+        adminListLayout.header.classList.remove("vw-admin-list-header");
         adminListLayout.controls.forEach((control) =>
           control.classList.remove("vw-admin-list-controls"));
-        adminListLayout.viewport?.classList.remove("vw-admin-list-viewport");
         adminListLayout = undefined;
       }
-      for (const host of scrollHosts) {
-        if (host.vwScrollScope === "admin" ||
-            (host.vwScrollScope === "vault" && !vault)) {
-          restoreScrollHost(host);
-        }
-      }
-      adminListRouteKey = undefined;
       return;
     }
 
-    const headers = [...main.querySelectorAll("app-header")].filter((header) =>
-      header.querySelector('input[type="search"]'));
-    const controls = [...main.children].filter((child) =>
-      child !== viewport && child.querySelector?.("bit-toggle-group, bit-callout"));
-    main.classList.toggle("vw-admin-list-layout", !!viewport);
+    const controls = [...page.children].filter((child) =>
+      child !== header && (child.matches("bit-toggle-group") || child.querySelector("bit-toggle-group")));
     main.classList.add("vw-admin-list-page");
-    headers.forEach((header) => header.classList.add("vw-admin-list-header"));
+    page.classList.add("vw-admin-list-content");
+    header.classList.add("vw-admin-list-header");
     controls.forEach((control) => control.classList.add("vw-admin-list-controls"));
-    viewport?.classList.add("vw-admin-list-viewport");
-    if (headers[0]) {
-      const height = Math.ceil(headers[0].getBoundingClientRect().height);
-      if (height > 0) main.style.setProperty("--vw-admin-header-height", `${height}px`);
-    }
-    if (!adminListLayout || adminListLayout.main !== main ||
-        adminListLayout.viewport !== viewport) {
-      for (const host of scrollHosts) {
-        if (host.vwScrollScope === "admin") restoreScrollHost(host);
-      }
-      adminListLayout = { main, headers, controls, viewport };
-    }
-    if (viewport) {
-      for (const host of scrollHosts) {
-        if (host.ref.nativeElement === main) setScrollHost(host, viewport, "admin");
-      }
-    }
+    const height = Math.ceil(header.getBoundingClientRect().height);
+    if (height > 0) main.style.setProperty("--vw-admin-header-height", `${height}px`);
     const routeKey = adminListKey(win.location.hash);
-    if (adminListRouteKey !== undefined && adminListRouteKey !== routeKey) {
+    if (adminListLayout?.page === page && adminListLayout.key !== routeKey) {
       clearSearchInputs(main);
-      win.setTimeout(() => {
-        if (adminListRouteKey === routeKey) clearSearchInputs(main);
-      }, 0);
+      main.scrollTop = 0;
+      main.dispatchEvent(new win.Event("scroll"));
     }
-    adminListRouteKey = routeKey;
+    adminListLayout = { main, page, header, controls, key: routeKey };
   }
 
   function element(tag, className, text) {
@@ -1333,6 +1288,17 @@
     new win.MutationObserver(schedule).observe(win.document.documentElement, { childList: true, subtree: true });
     win.document.addEventListener("click", (event) => {
       const target = event.target instanceof win.Element ? event.target : event.target?.parentElement;
+      const statusFilter = target?.closest(".vw-admin-list-controls bit-toggle");
+      if (statusFilter) {
+        win.setTimeout(() => {
+          const main = statusFilter.closest("main");
+          if (!main) return;
+          clearSearchInputs(main);
+          main.scrollTop = 0;
+          main.dispatchEvent(new win.Event("scroll"));
+        }, 0);
+        return;
+      }
       if (!target?.closest(
         'app-vault-filter .filter-button, app-organization-vault-filter .filter-button,' +
         '.vw-results-pane tr[appvaultcollectionrow] button[bitlink]')) return;
@@ -1344,6 +1310,15 @@
           input.dispatchEvent(new win.Event("input", { bubbles: true }));
         }
       }, 0);
+    }, true);
+    win.document.addEventListener("input", (event) => {
+      const input = event.target;
+      if (!input?.matches?.('.vw-admin-list-header input[type="search"]')) return;
+      const main = input.closest("main");
+      if (main) {
+        main.scrollTop = 0;
+        main.dispatchEvent(new win.Event("scroll"));
+      }
     }, true);
     win.addEventListener("hashchange", schedule);
     win.addEventListener("resize", schedule);

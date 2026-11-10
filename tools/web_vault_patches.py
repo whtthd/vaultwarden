@@ -7,10 +7,26 @@ ORIGINAL_LAZY_ASSETS = {
         "sha256": "c70e9e531e63c7321f38eafaa8082d96f04440889c555f4c2fe27c8952743bb8",
         "patches": [
             (
-                'if(yield this.searchService.isSearchable(i)){return(yield '
-                'this.searchService.searchCiphers(o,s,i,e)).filter(r)}return e.filter(r)',
-                'return window.VaultwardenEnhancements.searchOrganizationVaultCiphers('
-                'this,o,s,e,t,i,r,Se._)',
+                'this.ciphers$=(0,b.z)([this.allCiphers$,this.filter$,this.currentSearchText$,'
+                'this.showCollectionAccessRestricted$,this.userId$,this.organizationId$]).pipe('
+                '(0,pt.p)(([e,t])=>null!=e&&null!=t),(0,Ie.H)(e=>qi(this,[e],void 0,'
+                'function*([e,t,i,n,o,s]){if(void 0===t.collectionId&&void 0===t.type)return[];'
+                'if(n)return[];const r=(0,d.Jpj)(t);if(yield this.searchService.isSearchable(i)){'
+                'return(yield this.searchService.searchCiphers(o,s,i,e)).filter(r)}return e.filter(r)}))',
+                'this.vwSearchUserId$=this.userId$.pipe((0,He.$)(),'
+                '(0,v.t)({bufferSize:1,refCount:!1})),'
+                'this.ciphers$=(0,b.z)([this.allCiphers$,this.filter$,this.currentSearchText$,'
+                'this.showCollectionAccessRestricted$,this.userId$,this.organizationId$,'
+                'this.collectionService.nestedCollections$,this.accountService.activeAccount$,'
+                'this.vwSearchUserId$]).pipe((0,pt.p)(([e,t])=>null!=e&&null!=t),'
+                '(0,m.n)(([e,t,i,n,o,s,r,a,l])=>a?.id===o&&o===l?'
+                'window.VaultwardenEnhancements.searchOrganizationVaultCiphers('
+                'this,o,s,e,t,i,r,n,d.Jpj):Promise.resolve([]))',
+            ),
+            (
+                '.subscribe(e=>this.router.navigate([],{queryParams:{search:Mt.A.isNullOrEmpty(e)?null:e}',
+                '.subscribe(e=>window.VaultwardenEnhancements.searchMatchesInput(e)&&'
+                'this.router.navigate([],{queryParams:{search:Mt.A.isNullOrEmpty(e)?null:e}',
             ),
         ],
     },
