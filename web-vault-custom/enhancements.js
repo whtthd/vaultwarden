@@ -18,6 +18,8 @@
   let win;
   let scheduled = false;
   let layout;
+  let adminListLayout;
+  let adminListRouteKey;
   let memberSelectorId = 0;
 
   function copy(model) {
@@ -335,32 +337,59 @@
       "vaultId", "type", "search"].map((key) => key + "=" + (params.get(key) || "")).join("&");
   }
 
+  function adminListKey(hash) {
+    const [path, query = ""] = hash.split("?");
+    const params = new URLSearchParams(query);
+    const entries = [...params.entries()]
+      .filter(([key]) => key !== "search" && key !== "cipherId" && key !== "itemId" && key !== "action")
+      .sort(([a], [b]) => a.localeCompare(b));
+    return path + "?" + entries.map(([key, value]) => `${key}=${value}`).join("&");
+  }
+
+  function searchInputs(document = win?.document) {
+    const selector = 'app-vault-filter input[type="search"],' +
+      'app-organization-vault-filter input[type="search"],' +
+      'app-header input[type="search"]';
+    if (typeof document?.querySelectorAll === "function") {
+      return [...document.querySelectorAll(selector)];
+    }
+    const input = document?.querySelector?.('app-vault-filter input[type="search"]');
+    return input ? [input] : [];
+  }
+
   function searchMatchesInput(value, document = win?.document) {
-    const input = document?.querySelector('app-vault-filter input[type="search"]');
+    const input = searchInputs(document)[0];
     return !!input && input.value === (value ?? "");
   }
 
+  function collectionModel(node) { return node?.node ?? node; }
+  function collectionChildren(node) { return Array.isArray(node?.children) ? node.children : []; }
+  function collectionPath(model) { return model?.decryptionFailure ? undefined : model?.fullName ?? model?.name; }
+
   function collectionSearchFilter(filter, collectionTree, makeFilter) {
     if (filter.collectionId === undefined || filter.collectionId === "all" ||
-        filter.collectionId === "unassigned") return makeFilter(filter);
+        filter.collectionId === "AllCollections" || filter.collectionId === "unassigned") {
+      return makeFilter(filter);
+    }
 
     const collections = [];
     const pending = [...(collectionTree ?? [])];
     while (pending.length) {
       const node = pending.pop();
-      collections.push(node.node);
-      pending.push(...node.children);
+      const model = collectionModel(node);
+      if (model) collections.push(model);
+      pending.push(...collectionChildren(node));
     }
     const matches = collections.filter((c) => c.id === filter.collectionId);
     // A missing/revoked selection must never fall back to searching the entire vault.
     if (matches.length !== 1 || !matches[0].organizationId) return () => false;
     const selected = matches[0];
-    const path = selected.decryptionFailure ? undefined : selected.fullName;
+    const path = collectionPath(selected);
     const ids = new Set(collections.filter((c) =>
       !c.vwStructuralOnly && typeof c.id === "string" && !c.id.startsWith(structuralPrefix) &&
       c.organizationId === selected.organizationId &&
-      (c.id === selected.id || (!c.decryptionFailure && typeof path === "string" &&
-        path.length > 0 && c.fullName?.startsWith(path + "/")))).map((c) => c.id));
+      (c.id === selected.id || (typeof path === "string" && path.length > 0 &&
+        collectionPath(c)?.startsWith(path + "/")))).map((c) => c.id));
     const otherFilters = makeFilter({ ...filter, collectionId: undefined });
     return (cipher) => cipher.organizationId === selected.organizationId &&
       Array.isArray(cipher.collectionIds) && cipher.collectionIds.some((id) => ids.has(id)) &&
@@ -379,6 +408,42 @@
     const candidates = new Set(all);
     const results = await component.searchService.searchCiphers(userId, null, text, all);
     return results.filter((cipher) => candidates.has(cipher) && predicate(cipher));
+  }
+
+  async function readCollectionSource(source, firstValueFrom) {
+    if (source == null) return [];
+    if (typeof source.subscribe === "function") return firstValueFrom(source);
+    if (typeof source.then === "function") return source;
+    return source;
+  }
+
+  async function searchOrganizationVaultCiphers(component, userId, organizationId, ciphers,
+    filter, text, makeFilter, firstValueFrom) {
+    const all = Array.isArray(ciphers) ? ciphers : [];
+    if (!await component.searchService.isSearchable(text)) return all.filter(makeFilter(filter));
+
+    let collections;
+    if (filter.collectionId === undefined || filter.collectionId === "all" ||
+        filter.collectionId === "AllCollections" || filter.collectionId === "unassigned") {
+      collections = undefined;
+    } else {
+      try {
+        collections = await readCollectionSource(component.allCollections$, firstValueFrom);
+      } catch (_) {
+        // An unavailable collection snapshot must never widen a scoped search.
+        return [];
+      }
+    }
+    const predicate = collectionSearchFilter(filter, collections, makeFilter);
+    const candidates = new Map(all.map((cipher) => [cipher.id, cipher]));
+    const results = await component.searchService.searchCiphers(
+      userId, organizationId, text, all);
+    const returned = new Set();
+    return results.filter((cipher) => {
+      if (!cipher || !candidates.has(cipher.id) || returned.has(cipher.id)) return false;
+      returned.add(cipher.id);
+      return predicate(cipher);
+    });
   }
 
   function descendantRows(original, descendants) {
@@ -404,16 +469,33 @@
   }
 
   function registerScrollHost(host) { scrollHosts.add(host); schedule(); }
-  function unregisterScrollHost(host) {
+  function restoreScrollHost(host) {
     if (host.vwScrollRef && host.service.scrollableRef() === host.vwScrollRef) {
       host.service.scrollableRef.set(host.ref);
     }
+    host.vwScrollRef = undefined;
+    host.vwScrollScope = undefined;
+  }
+
+  function setScrollHost(host, nativeElement, scope) {
+    if (host.vwScrollRef?.nativeElement === nativeElement &&
+        host.vwScrollScope === scope) return;
+    restoreScrollHost(host);
+    host.vwScrollRef = { nativeElement };
+    host.vwScrollScope = scope;
+    host.service.scrollableRef.set(host.vwScrollRef);
+    win.requestAnimationFrame(() => win.dispatchEvent(new Event("resize")));
+  }
+
+  function unregisterScrollHost(host) {
+    restoreScrollHost(host);
     scrollHosts.delete(host);
   }
 
   function updateFilterStickyOffset(filters) {
     const header = filters.querySelector(
-      'app-vault-filter [data-testid="filters-header"]');
+      'app-vault-filter [data-testid="filters-header"],' +
+      'app-organization-vault-filter [data-testid="filters-header"]');
     if (!header) {
       filters.style.removeProperty("--vw-filter-header-height");
       return;
@@ -423,18 +505,13 @@
   }
 
   function updateLayout() {
-    const vault = win.document.querySelector("main#main-content app-vault");
+    const vault = win.document.querySelector(
+      "main#main-content app-vault, main#main-content app-org-vault");
     const row = vault && [...vault.children].find((e) => e.classList.contains("tw-flex-row"));
     if (!row || row.children.length !== 2) {
       if (layout) {
         layout.main.classList.remove("vw-vault-layout");
         layout = undefined;
-      }
-      for (const host of scrollHosts) {
-        if (host.vwScrollRef && host.service.scrollableRef() === host.vwScrollRef) {
-          host.service.scrollableRef.set(host.ref);
-          host.vwScrollRef = undefined;
-        }
       }
       return;
     }
@@ -456,12 +533,7 @@
       layout = { main, filters, results, key: undefined };
     }
     for (const host of scrollHosts) {
-      if (host.ref.nativeElement !== main) continue;
-      if (!host.vwScrollRef || host.vwScrollRef.nativeElement !== results) {
-        host.vwScrollRef = { nativeElement: results };
-        host.service.scrollableRef.set(host.vwScrollRef);
-        win.requestAnimationFrame(() => win.dispatchEvent(new Event("resize")));
-      }
+      if (host.ref.nativeElement === main) setScrollHost(host, results, "vault");
     }
     const key = navigationKey(win.location.hash);
     if (layout.key !== key) {
@@ -469,6 +541,78 @@
       results.scrollTop = 0;
       results.dispatchEvent(new Event("scroll"));
     }
+  }
+
+  function clearSearchInputs(main) {
+    for (const input of searchInputs(main.ownerDocument)) {
+      if (!main.contains(input) || !input.value) continue;
+      input.value = "";
+      input.dispatchEvent(new win.Event("input", { bubbles: true }));
+    }
+  }
+
+  function updateAdminListLayout() {
+    const main = win.document.querySelector("main#main-content");
+    if (!main) return;
+    const vault = main.querySelector("app-vault, app-org-vault");
+    const viewport = [...main.querySelectorAll("cdk-virtual-scroll-viewport[bitScrollLayout]")]
+      .find((node) => !node.closest("cdk-dialog-container, dialog"));
+    const adminPage = !vault && main.querySelector("app-header") &&
+      (win.location.hash.includes("/organizations/") || !!viewport);
+    if (!adminPage) {
+      if (adminListLayout) {
+        adminListLayout.main.classList.remove("vw-admin-list-layout");
+        adminListLayout.main.classList.remove("vw-admin-list-page");
+        adminListLayout.headers.forEach((header) =>
+          header.classList.remove("vw-admin-list-header"));
+        adminListLayout.controls.forEach((control) =>
+          control.classList.remove("vw-admin-list-controls"));
+        adminListLayout.viewport?.classList.remove("vw-admin-list-viewport");
+        adminListLayout = undefined;
+      }
+      for (const host of scrollHosts) {
+        if (host.vwScrollScope === "admin" ||
+            (host.vwScrollScope === "vault" && !vault)) {
+          restoreScrollHost(host);
+        }
+      }
+      adminListRouteKey = undefined;
+      return;
+    }
+
+    const headers = [...main.querySelectorAll("app-header")].filter((header) =>
+      header.querySelector('input[type="search"]'));
+    const controls = [...main.children].filter((child) =>
+      child !== viewport && child.querySelector?.("bit-toggle-group, bit-callout"));
+    main.classList.toggle("vw-admin-list-layout", !!viewport);
+    main.classList.add("vw-admin-list-page");
+    headers.forEach((header) => header.classList.add("vw-admin-list-header"));
+    controls.forEach((control) => control.classList.add("vw-admin-list-controls"));
+    viewport?.classList.add("vw-admin-list-viewport");
+    if (headers[0]) {
+      const height = Math.ceil(headers[0].getBoundingClientRect().height);
+      if (height > 0) main.style.setProperty("--vw-admin-header-height", `${height}px`);
+    }
+    if (!adminListLayout || adminListLayout.main !== main ||
+        adminListLayout.viewport !== viewport) {
+      for (const host of scrollHosts) {
+        if (host.vwScrollScope === "admin") restoreScrollHost(host);
+      }
+      adminListLayout = { main, headers, controls, viewport };
+    }
+    if (viewport) {
+      for (const host of scrollHosts) {
+        if (host.ref.nativeElement === main) setScrollHost(host, viewport, "admin");
+      }
+    }
+    const routeKey = adminListKey(win.location.hash);
+    if (adminListRouteKey !== undefined && adminListRouteKey !== routeKey) {
+      clearSearchInputs(main);
+      win.setTimeout(() => {
+        if (adminListRouteKey === routeKey) clearSearchInputs(main);
+      }, 0);
+    }
+    adminListRouteKey = routeKey;
   }
 
   function element(tag, className, text) {
@@ -1162,6 +1306,7 @@
     win.requestAnimationFrame(() => {
       scheduled = false;
       updateLayout();
+      updateAdminListLayout();
       renderCipherRows();
       for (const state of memberSelectors.values()) renderMemberCollectionSelector(state);
       for (const state of dialogs.values()) {
@@ -1188,13 +1333,16 @@
     new win.MutationObserver(schedule).observe(win.document.documentElement, { childList: true, subtree: true });
     win.document.addEventListener("click", (event) => {
       const target = event.target instanceof win.Element ? event.target : event.target?.parentElement;
-      if (!target?.closest('app-vault-filter .filter-button, .vw-results-pane tr[appvaultcollectionrow] button[bitlink]')) return;
+      if (!target?.closest(
+        'app-vault-filter .filter-button, app-organization-vault-filter .filter-button,' +
+        '.vw-results-pane tr[appvaultcollectionrow] button[bitlink]')) return;
       // Let RouterLink handle this click before a form update can recreate its row.
       win.setTimeout(() => {
-        const input = win.document.querySelector('app-vault-filter input[type="search"]');
-        if (!input?.value) return;
-        input.value = "";
-        input.dispatchEvent(new win.Event("input", { bubbles: true }));
+        for (const input of searchInputs()) {
+          if (!input.value) continue;
+          input.value = "";
+          input.dispatchEvent(new win.Event("input", { bubbles: true }));
+        }
       }, 0);
     }, true);
     win.addEventListener("hashchange", schedule);
@@ -1206,6 +1354,7 @@
     saveCollection, createCollection, collectionPathError, nestedCollectionTraverse,
     planCollectionUpdate, accessDelta, applyDelta, isDescendant, navigationKey,
     searchMatchesInput, collectionSearchFilter, searchVaultCiphers,
+    searchOrganizationVaultCiphers,
     descendantRows, selectionState, toggleSelection, revocationCandidates,
     cloneSourceWithoutItemAccess, itemGrants, saveItemAccess,
     memberCollectionRows, planMemberCollectionAccess, applyMemberCollectionAccess,

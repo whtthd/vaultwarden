@@ -15,9 +15,12 @@ test('filter title and search area use the left pane sticky layout', () => {
   const fs = require('node:fs');
   const css = fs.readFileSync(require('node:path').join(__dirname, 'enhancements.css'), 'utf8');
   assert.match(css, /\.vw-filter-pane app-vault-filter \[data-testid="filters-header"\][\s\S]*position:\s*sticky/);
+  assert.match(css, /\.vw-filter-pane app-organization-vault-filter \[data-testid="filters-header"\]/);
   assert.match(css, /\.vw-filter-pane app-vault-filter \[data-testid="filters-body"\] > \.tw-mb-4[\s\S]*position:\s*sticky/);
   assert.match(css, /top:\s*var\(--vw-filter-header-height/);
   assert.match(css, /background:\s*var\(--color-bg-primary\)/);
+  assert.match(css, /main#main-content\.vw-admin-list-layout/);
+  assert.match(css, /\.vw-admin-list-viewport/);
 });
 
 function collection(id, name, extra = {}) {
@@ -316,6 +319,54 @@ test('recursive collection search delegates every other filter to the unmodified
   assert.equal(filter.collectionId, 'parent');
   assert.equal(recursiveSearchFilter([collection('parent', 'A'), collection('child', 'A/B')],
     'parent', { organizationId: 'another-org' })(searchCipher('wrong-org', ['child'])), false);
+});
+
+test('admin collection search accepts a flat catalog while remaining inside the authorized cipher feed', async () => {
+  const parent = collection('parent', 'Operations');
+  const child = collection('child', 'Operations/Production');
+  const sibling = collection('sibling', 'Other');
+  const authorized = [
+    searchCipher('parent-item', ['parent']),
+    searchCipher('child-item', ['child']),
+    searchCipher('sibling-item', ['sibling']),
+  ];
+  const component = {
+    allCollections$: [parent, child, sibling],
+    searchService: {
+      isSearchable: async () => true,
+      searchCiphers: async (user, org, text, candidates) => {
+        assert.equal(user, 'admin-user');
+        assert.equal(org, 'org');
+        assert.equal(text, 'secret');
+        return [...candidates, searchCipher('forged', ['child'])];
+      },
+    },
+  };
+  const makeFilter = (filter) => (cipher) =>
+    (filter.collectionId === undefined || cipher.collectionIds?.includes(filter.collectionId)) &&
+    cipher.organizationId === 'org';
+  const result = await enhancements.searchOrganizationVaultCiphers(
+    component, 'admin-user', 'org', authorized,
+    { collectionId: 'parent' }, 'secret', makeFilter, async (value) => value,
+  );
+  assert.deepEqual(result.map((cipher) => cipher.id), ['parent-item', 'child-item']);
+});
+
+test('admin collection search fails closed when its collection snapshot is unavailable', async () => {
+  const component = {
+    allCollections$: { subscribe() { throw new Error('unavailable'); } },
+    searchService: {
+      isSearchable: async () => true,
+      searchCiphers: async () => [searchCipher('visible', ['child'])],
+    },
+  };
+  const result = await enhancements.searchOrganizationVaultCiphers(
+    component, 'admin-user', 'org', [searchCipher('visible', ['child'])],
+    { collectionId: 'parent' }, 'secret', () => () => true, async () => {
+      throw new Error('unavailable');
+    },
+  );
+  assert.deepEqual(result, []);
 });
 
 test('basic and advanced collection searches keep the full authorized input and reject extraneous results', async () => {

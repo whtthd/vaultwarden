@@ -5,6 +5,35 @@ main#main-content.vw-vault-layout {
   overflow: hidden;
   min-height: 0;
 }
+/* Admin tables keep their header and filters outside the CDK viewport. */
+main#main-content.vw-admin-list-layout {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+main#main-content.vw-admin-list-layout .vw-admin-list-header {
+  background: var(--color-bg-primary);
+  position: sticky;
+  top: 0;
+  z-index: 8;
+}
+main#main-content.vw-admin-list-layout .vw-admin-list-controls {
+  background: var(--color-bg-primary);
+  position: sticky;
+  top: var(--vw-admin-header-height, 4rem);
+  z-index: 7;
+}
+main#main-content.vw-admin-list-layout .vw-admin-list-viewport {
+  flex: 1 1 0;
+  min-height: 0;
+  overscroll-behavior-y: contain;
+  scrollbar-gutter: stable;
+}
+main#main-content.vw-admin-list-layout .vw-admin-list-viewport:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: -2px;
+}
 .vw-vault {
   display: flex;
   flex: 1 1 0;
@@ -28,12 +57,14 @@ main#main-content.vw-vault-layout {
 .vw-filter-pane:focus-visible,
 .vw-results-pane:focus-visible { outline: 2px solid currentColor; outline-offset: -2px; }
 /* Keep the filter title and search field available while the collection tree scrolls. */
-.vw-filter-pane app-vault-filter [data-testid="filters-header"] {
+.vw-filter-pane app-vault-filter [data-testid="filters-header"],
+.vw-filter-pane app-organization-vault-filter [data-testid="filters-header"] {
   position: sticky;
   top: 0;
   z-index: 5;
 }
-.vw-filter-pane app-vault-filter [data-testid="filters-body"] > .tw-mb-4 {
+.vw-filter-pane app-vault-filter [data-testid="filters-body"] > .tw-mb-4,
+.vw-filter-pane app-organization-vault-filter [data-testid="filters-body"] > .tw-mb-4 {
   position: sticky;
   top: var(--vw-filter-header-height, 3rem);
   z-index: 4;

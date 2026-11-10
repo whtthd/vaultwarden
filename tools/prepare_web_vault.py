@@ -7,7 +7,13 @@ from pathlib import Path
 import re
 import sys
 
-from web_vault_patches import ORIGINAL_ASSET, ORIGINAL_SHA256, patch_bundle
+from web_vault_patches import (
+    ORIGINAL_ASSET,
+    ORIGINAL_LAZY_ASSETS,
+    ORIGINAL_SHA256,
+    patch_bundle,
+    patch_lazy_bundle,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 BLOCK = re.compile(rb'<!-- vaultwarden-enhancements:start -->.*?<!-- vaultwarden-enhancements:end -->', re.S)
@@ -38,7 +44,21 @@ def prepare(restore=False, local_dev=False, root=ROOT):
     if restore:
         updated = clean[:match.start()] + original_tag + clean[match.end():]
     else:
-        patched = patch_bundle(original, local_dev)
+        lazy_assets = {}
+        for original_name, spec in ORIGINAL_LAZY_ASSETS.items():
+            lazy_path = web_vault / original_name
+            if not lazy_path.is_file():
+                raise ValueError("The web-vault lazy chunk is missing: " + original_name)
+            lazy_original = lazy_path.read_bytes()
+            if hashlib.sha256(lazy_original).hexdigest() != spec["sha256"]:
+                raise ValueError("The web-vault lazy chunk differs from the supported release: " +
+                                 original_name)
+            lazy_patched = patch_lazy_bundle(lazy_original, original_name)
+            lazy_digest = hashlib.sha256(lazy_patched).hexdigest()[:20]
+            lazy_asset = f"{original_name.split('.', 1)[0]}.{lazy_digest}.js"
+            write_checked(web_vault / lazy_asset, lazy_patched)
+            lazy_assets[original_name] = lazy_asset
+        patched = patch_bundle(original, local_dev, lazy_assets)
         digest = hashlib.sha256(patched).hexdigest()[:20]
         asset = f"app/main.{digest}.vaultwarden.js"
         write_checked(web_vault / asset, patched)
@@ -63,7 +83,7 @@ def prepare(restore=False, local_dev=False, root=ROOT):
     if restore:
         print("Restored the original web-vault bundle reference.")
     else:
-        print("Prepared vault scrolling, navigation, collection access and subtree updates.")
+        print("Prepared vault and Admin Console scrolling, navigation, search and collection updates.")
         if local_dev:
             print("Enabled Never timeout for HTTPS loopback pages on port 8001.")
 

@@ -2,6 +2,19 @@
 
 ORIGINAL_ASSET = "app/main.1176a28a68b7b4809391.js"
 ORIGINAL_SHA256 = "5defb27621655bc05a54d042e32ce21d66dadd337b3bc60bc0cb49c234e441d1"
+ORIGINAL_LAZY_ASSETS = {
+    "397.140f77b7f5a3e6236b43.js": {
+        "sha256": "c70e9e531e63c7321f38eafaa8082d96f04440889c555f4c2fe27c8952743bb8",
+        "patches": [
+            (
+                'if(yield this.searchService.isSearchable(i)){return(yield '
+                'this.searchService.searchCiphers(o,s,i,e)).filter(r)}return e.filter(r)',
+                'return window.VaultwardenEnhancements.searchOrganizationVaultCiphers('
+                'this,o,s,e,t,i,r,Se._)',
+            ),
+        ],
+    },
+}
 LOCAL_ORIGIN = (
     '(window.location.protocol==="https:"&&window.location.port==="8001"&&'
     '["127.0.0.1","localhost","[::1]"].includes(window.location.hostname))'
@@ -108,10 +121,30 @@ ENHANCEMENT_PATCHES = [
 ]
 
 
-def patch_bundle(original, local_dev=False):
+def patch_lazy_bundle(original, asset):
+    spec = ORIGINAL_LAZY_ASSETS[asset]
+    patched = original
+    for before, after in spec["patches"]:
+        if patched.count(before.encode()) != 1:
+            raise ValueError("Expected one supported lazy web-vault hook: " + before[:60])
+        patched = patched.replace(before.encode(), after.encode(), 1)
+    return patched
+
+
+def patch_bundle(original, local_dev=False, lazy_assets=None):
     patched = original
     for before, after in ENHANCEMENT_PATCHES + (LOCAL_PATCHES if local_dev else []):
         if patched.count(before.encode()) != 1:
             raise ValueError("Expected one supported web-vault hook: " + before[:60])
         patched = patched.replace(before.encode(), after.encode(), 1)
+    for original_name, generated_name in (lazy_assets or {}).items():
+        # Webpack stores the chunk content hash in the main bundle's filename map.
+        # Replace only the hash, preserving the numeric chunk id and extension.
+        original_hash = original_name.removesuffix(".js").split(".")[1].encode()
+        generated_hash = generated_name.removesuffix(".js").split(".")[1].encode()
+        hook = b'"' + original_hash + b'"'
+        replacement = b'"' + generated_hash + b'"'
+        if patched.count(hook) != 1:
+            raise ValueError("Expected one lazy chunk filename hook: " + original_name)
+        patched = patched.replace(hook, replacement, 1)
     return patched

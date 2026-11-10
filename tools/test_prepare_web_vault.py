@@ -14,7 +14,14 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from prepare_web_vault import prepare, ROOT
-from web_vault_patches import ORIGINAL_ASSET, ENHANCEMENT_PATCHES, LOCAL_PATCHES, patch_bundle
+from web_vault_patches import (
+    ENHANCEMENT_PATCHES,
+    LOCAL_PATCHES,
+    ORIGINAL_ASSET,
+    ORIGINAL_LAZY_ASSETS,
+    patch_bundle,
+    patch_lazy_bundle,
+)
 
 
 class PreparationTests(unittest.TestCase):
@@ -28,6 +35,10 @@ class PreparationTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         (self.root / 'web-vault/app').mkdir(parents=True)
         (self.root / 'web-vault' / ORIGINAL_ASSET).write_bytes(self.bundle)
+        for asset in ORIGINAL_LAZY_ASSETS:
+            source = ROOT / 'web-vault' / asset
+            destination = self.root / 'web-vault' / asset
+            destination.write_bytes(source.read_bytes())
         self.index = self.root / 'web-vault/index.html'
         self.original_index = f'<html><head></head><body><script src="{ORIGINAL_ASSET}" defer></script></body></html>'.encode()
         self.index.write_bytes(self.original_index)
@@ -53,6 +64,27 @@ class PreparationTests(unittest.TestCase):
         self.assertIn(
             b'registerMemberCollectionSelector(this,(0,r.WQX)(w.aKT).nativeElement)', patched)
         self.assertIn(b'ngOnDestroy(){window.VaultwardenEnhancements.unregisterMemberCollectionSelector(this)}', patched)
+
+    def test_admin_collection_chunk_hook_is_pinned_and_rewrites_runtime_filename(self):
+        asset, spec = next(iter(ORIGINAL_LAZY_ASSETS.items()))
+        original = (ROOT / 'web-vault' / asset).read_bytes()
+        patched = patch_lazy_bundle(original, asset)
+        self.assertIn(b'window.VaultwardenEnhancements.searchOrganizationVaultCiphers', patched)
+        self.assertNotIn(
+            b'if(yield this.searchService.isSearchable(i)){return(yield '
+            b'this.searchService.searchCiphers(o,s,i,e)).filter(r)}return e.filter(r)',
+            patched,
+        )
+        self.prepare()
+        generated = [
+            path for path in (self.root / 'web-vault').glob('397.*.js')
+            if path.name != asset
+        ]
+        self.assertEqual(len(generated), 1)
+        generated_name = generated[0].name
+        main = (self.root / 'web-vault/app').glob('main.*.vaultwarden.js')
+        main_bytes = next(main).read_bytes()
+        self.assertIn(generated_name.split('.')[1].encode(), main_bytes)
 
     def test_prepare_is_idempotent_and_restore_is_exact(self):
         self.prepare(local_dev=True)
@@ -96,6 +128,13 @@ class PreparationTests(unittest.TestCase):
                 capture_output=True, check=False)
             error = re.search(rb'SyntaxError:[^\n]*', result.stderr)
             self.assertEqual(result.returncode, 0, error.group().decode() if error else 'Syntax check failed')
+        for asset in ORIGINAL_LAZY_ASSETS:
+            result = subprocess.run(
+                ['node', '--check'],
+                input=patch_lazy_bundle((ROOT / 'web-vault' / asset).read_bytes(), asset),
+                capture_output=True, check=False)
+            error = re.search(rb'SyntaxError:[^\n]*', result.stderr)
+            self.assertEqual(result.returncode, 0, error.group().decode() if error else 'Lazy syntax check failed')
 
     @unittest.skipUnless(shutil.which('node'), 'Node.js is needed for pinned search integration tests')
     def test_pinned_search_preserves_existing_filters_and_checks_the_active_account(self):

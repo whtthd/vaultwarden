@@ -15,6 +15,15 @@ For Chinese usage instructions and permission cautions, see
   scrolls. The results pane is also the Angular CDK virtual list's scroll host,
   so large vaults continue rendering rows as they scroll. Selecting a filter
   resets only the results scroll position.
+- The Admin Console organization vault uses the same independent panes and keeps
+  its filter title and search field visible while the collection tree scrolls.
+  Its collection search includes descendant paths only after intersecting the
+  current organization cipher snapshot; the admin collection catalog cannot grant
+  a cipher that the account cannot already read.
+- Admin Console member and group tables use the CDK viewport as their own scroll
+  host. Their search/header controls and the member status filter remain visible
+  while rows scroll. Switching organization or management pages clears stale list
+  searches, while changing only the search text does not clear the active query.
 - Selecting a collection, folder, organization or item type clears the previous
   text search. Following a collection from search results also clears it. A
   pending search debounce cannot restore text cleared by navigation.
@@ -107,6 +116,9 @@ source tree. Readable extensions live in `web-vault-custom/enhancements.js` and
 
 Supported upstream bundle: **2026.10.1**, SHA-256
 `5defb27621655bc05a54d042e32ce21d66dadd337b3bc60bc0cb49c234e441d1`.
+The Admin Console organization-vault search hook also pins and rewrites lazy
+chunk `397.140f77b7f5a3e6236b43.js`; preparation updates the main bundle's
+Webpack filename map so the patched chunk is loaded with a new cache-busting hash.
 Preparation refuses an unsupported or modified original bundle and requires each
 hook to match exactly once. An upstream upgrade requires reviewing and adapting
 the hooks. The original bundle is retained. Generated JavaScript and styles use
