@@ -28,5 +28,6 @@ extend-ignore-re = [
 ]
 
 [default.extend-identifiers]
-# Exact identifier in the pinned upstream web-vault bundle; it must not be renamed.
+# Exact identifiers in the pinned upstream web-vault bundle; they must not be renamed.
+Ot = "Ot"
 Ue = "Ue"

@@ -7,6 +7,21 @@ ORIGINAL_LAZY_ASSETS = {
         "sha256": "c70e9e531e63c7321f38eafaa8082d96f04440889c555f4c2fe27c8952743bb8",
         "patches": [
             (
+                'get searchPlaceholder(){var e;const t=this.activeFilter();return t.isDeleted?'
+                '"searchTrash":t.cipherType===ui.gC.Login?"searchLogin":t.cipherType===ui.gC.Card?'
+                '"searchCard":t.cipherType===ui.gC.BankAccount?"searchBankAccount":'
+                't.cipherType===ui.gC.Identity?"searchIdentity":t.cipherType===ui.gC.SecureNote?'
+                '"searchSecureNote":t.cipherType===ui.gC.SshKey?"searchSshKey":'
+                't.cipherType===ui.gC.Passport?"searchPassport":t.cipherType===ui.gC.DriversLicense?'
+                '"searchDriversLicense":(null===(e=t.selectedCollectionNode)||void 0===e?void 0:e.node)?'
+                'this.vfo1TerminologyService.enabled()?"searchSharedFolder":"searchCollection":"searchVault"}',
+                'get searchPlaceholder(){return"searchVault"}',
+            ),
+            (
+                '("placeholder",E.i5U(1,2,"searchCollection","searchSharedFolder"))',
+                '("placeholder",E.i5U(1,2,"searchVault","searchVault"))',
+            ),
+            (
                 'this.ciphers$=(0,b.z)([this.allCiphers$,this.filter$,this.currentSearchText$,'
                 'this.showCollectionAccessRestricted$,this.userId$,this.organizationId$]).pipe('
                 '(0,pt.p)(([e,t])=>null!=e&&null!=t),(0,Ie.H)(e=>qi(this,[e],void 0,'
@@ -28,6 +43,30 @@ ORIGINAL_LAZY_ASSETS = {
                 '.subscribe(e=>window.VaultwardenEnhancements.searchMatchesInput(e)&&'
                 'this.router.navigate([],{queryParams:{search:Mt.A.isNullOrEmpty(e)?null:e}',
             ),
+            (
+                'const l=(0,b.z)([this.nestedCollections$,n,s,this._addAccessStatus$,e,i]).pipe('
+                '(0,pt.p)(([e,t])=>null!=e&&null!=t),(0,Ie.H)(e=>Yt(this,[e],void 0,'
+                'function*([e,t,i,n,,o]){var s;if(t.collectionId===Te.I_||void 0===t.collectionId&&'
+                'void 0!==t.type)return{collections:[],showAddAccessToggle:!1};let r=[];'
+                'if(void 0===t.collectionId||t.collectionId===d.u8Z)r=e;else{'
+                'const i=Qt.F.getTreeNodeObjectFromList(e,t.collectionId);'
+                'r=null!==(s=null==i?void 0:i.children)&&void 0!==s?s:[]}let a=[];'
+                'if(yield this.searchService.isSearchable(i)){const e=(0,_t.eO)(r);'
+                'a=this.searchPipe.transform(e,i,e=>e.name,e=>e.id)}else a=r.map(e=>e.node);'
+                'const l=!o.allowAdminAccessToAllCollectionItems&&o.canEditUnmanagedCollections&&'
+                'a.some(e=>e.unmanaged);return n===Ot.AddAccess&&l&&(a=a.filter(e=>e.unmanaged)),'
+                '{collections:a,showAddAccessToggle:l}}))',
+                'this.vwSearchUserId$=e.pipe((0,He.$)(),(0,v.t)({bufferSize:1,refCount:!1}));'
+                'const l=(0,b.z)([this.nestedCollections$,n,s,this._addAccessStatus$,e,i,'
+                'this.accountService.activeAccount$,this.vwSearchUserId$]).pipe('
+                '(0,pt.p)(([e,t])=>null!=e&&null!=t),(0,r.T)(([e,t,i,n,s,o,u,h])=>{'
+                'if(u?.id!==s||s!==h||o.id!==t.organizationId)'
+                'return{collections:[],showAddAccessToggle:!1};'
+                'let a=window.VaultwardenEnhancements.searchVaultCollections(e,t,i,!0);'
+                'const l=!o.allowAdminAccessToAllCollectionItems&&o.canEditUnmanagedCollections&&'
+                'a.some(e=>e.unmanaged);return n===Ot.AddAccess&&l&&(a=a.filter(e=>e.unmanaged)),'
+                '{collections:a,showAddAccessToggle:l}})',
+            ),
         ],
     },
 }
@@ -46,6 +85,25 @@ LOCAL_PATCHES = [
     ),
 ]
 ENHANCEMENT_PATCHES = [
+    (
+        'get searchPlaceholder(){var e,t;return this.activeFilter.isFavorites?"searchFavorites":'
+        'this.activeFilter.isDeleted?"searchTrash":this.activeFilter.isArchived?"searchArchive":'
+        'this.activeFilter.cipherType===nu.gC.Login?"searchLogin":'
+        'this.activeFilter.cipherType===nu.gC.Card?"searchCard":'
+        'this.activeFilter.cipherType===nu.gC.Identity?"searchIdentity":'
+        'this.activeFilter.cipherType===nu.gC.SecureNote?"searchSecureNote":'
+        'this.activeFilter.cipherType===nu.gC.SshKey?"searchSshKey":'
+        'this.activeFilter.cipherType===nu.gC.BankAccount?"searchBankAccount":'
+        'this.activeFilter.cipherType===nu.gC.Passport?"searchPassport":'
+        'this.activeFilter.cipherType===nu.gC.DriversLicense?"searchDriversLicense":'
+        '(null===(e=this.activeFilter.selectedFolderNode)||void 0===e?void 0:e.node)?'
+        'this.vfo1TerminologyService.enabled()?"searchMyFolder":"searchFolder":'
+        '(null===(t=this.activeFilter.selectedCollectionNode)||void 0===t?void 0:t.node)?'
+        'this.vfo1TerminologyService.enabled()?"searchSharedFolder":"searchCollection":'
+        '"MyVault"===this.activeFilter.organizationId?"searchMyVault":'
+        'this.activeFilter.organizationId?"searchOrganization":"searchVault"}',
+        'get searchPlaceholder(){return"searchVault"}',
+    ),
     (
         'collectionQueryParams(e){const t=null!=e?e:null;return this.enabled()?'
         '{sharedFolderId:t,collectionId:null}:{collectionId:t,sharedFolderId:null}}',
@@ -133,6 +191,18 @@ ENHANCEMENT_PATCHES = [
         '(0,h.p)(([e,t])=>null!=e&&null!=t),'
         '(0,Le.n)(([t,i,n,r,s])=>null!=s&&s.id===e?'
         'window.VaultwardenEnhancements.searchVaultCiphers(this,e,t,i,n,r,Bh.Jpj,u._):Promise.resolve([]))',
+    ),
+    (
+        'l=(0,Ke.z)([r,i,this.currentSearchText$]).pipe((0,h.p)(([e,t])=>null!=e&&null!=t),'
+        '(0,Sl.H)(e=>RG(this,[e],void 0,function*([e,t,i]){var n;if(void 0===t.collectionId||'
+        't.collectionId===hc.I_)return[];let r=[];if(void 0!==t.organizationId&&'
+        't.collectionId===Bh.u8Z)r=e.filter(e=>e.node.organizationId===t.organizationId);'
+        'else if(t.collectionId===Bh.u8Z)r=e;else{const i=sG.F.getTreeNodeObjectFromList(e,t.collectionId);'
+        'r=null!==(n=null==i?void 0:i.children)&&void 0!==n?n:[]}if(yield this.searchService.isSearchable(i)){'
+        'const e=(0,nG.eO)(r);return this.searchPipe.transform(e,i,e=>e.name,e=>e.id)}return r.map(e=>e.node)}))',
+        'l=(0,Ke.z)([r,i,this.currentSearchText$,this.accountService.activeAccount$]).pipe('
+        '(0,h.p)(([e,t])=>null!=e&&null!=t),(0,g.T)(([t,i,n,r])=>r?.id===e?'
+        'window.VaultwardenEnhancements.searchVaultCollections(t,i,n):[])',
     ),
 ]
 

@@ -341,9 +341,10 @@
   }
 
   function searchInputs(document = win?.document) {
-    const selector = 'app-vault-filter input[type="search"],' +
-      'app-organization-vault-filter input[type="search"],' +
-      'app-header input[type="search"]';
+    // Safari renders bit-search as type=text.
+    const selector = 'app-vault-filter bit-search input[name="searchText"],' +
+      'app-organization-vault-filter bit-search input[name="searchText"],' +
+      'app-header bit-search input[name="searchText"]';
     if (typeof document?.querySelectorAll === "function") {
       return [...document.querySelectorAll(selector)];
     }
@@ -364,20 +365,38 @@
     return typeof path === "string" ? path.replace(/^\/+|\/+$/g, "") : undefined;
   }
 
+  function vaultQuery(text) {
+    const query = typeof text === "string" ? text.trim() : "";
+    return { text: query, active: query.length > 0, advanced: query.startsWith(">") && query.length > 1 };
+  }
+
+  function searchTerms(text) {
+    return text.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().split(/\s+/).filter(Boolean);
+  }
+
+  function collectionNodes(tree) {
+    const nodes = [];
+    const pending = [...(tree ?? [])].reverse();
+    while (pending.length) {
+      const node = pending.pop();
+      if (collectionModel(node)) nodes.push(node);
+      pending.push(...collectionChildren(node).slice().reverse());
+    }
+    return nodes;
+  }
+
+  function allCollectionsSelected(id) { return id === "all" || id === "AllCollections"; }
+
   function collectionSearchFilter(filter, collectionTree, makeFilter, excludeSelected = false) {
-    if (filter.collectionId === undefined || filter.collectionId === "all" ||
-        filter.collectionId === "AllCollections" || filter.collectionId === "unassigned") {
+    if (allCollectionsSelected(filter.collectionId)) {
+      const otherFilters = makeFilter({ ...filter, collectionId: undefined });
+      return (cipher) => !!cipher.organizationId && otherFilters(cipher);
+    }
+    if (filter.collectionId === undefined || filter.collectionId === "unassigned") {
       return makeFilter(filter);
     }
 
-    const collections = [];
-    const pending = [...(collectionTree ?? [])];
-    while (pending.length) {
-      const node = pending.pop();
-      const model = collectionModel(node);
-      if (model) collections.push(model);
-      pending.push(...collectionChildren(node));
-    }
+    const collections = collectionNodes(collectionTree).map(collectionModel);
     const matches = collections.filter((c) => c.id === filter.collectionId);
     // A missing/revoked selection must never fall back to searching the entire vault.
     if (matches.length !== 1 || !matches[0].organizationId) return () => false;
@@ -394,36 +413,161 @@
       otherFilters(cipher);
   }
 
+  function searchVaultCollections(tree, filter, text, admin = false) {
+    const query = vaultQuery(text);
+    if (filter.organizationId === "unassigned" || filter.collectionId === "unassigned" ||
+        filter.folderId !== undefined ||
+        (filter.type !== undefined && filter.type !== "all") || query.advanced) return [];
+    if (!query.active && admin && filter.collectionId === undefined && filter.type !== undefined) return [];
+    if (!query.active && filter.collectionId === undefined && !admin) return [];
+    const nodes = collectionNodes(tree);
+    let scope = nodes;
+    if (filter.collectionId !== undefined && !allCollectionsSelected(filter.collectionId)) {
+      const matches = nodes.filter((node) => collectionModel(node).id === filter.collectionId);
+      if (matches.length !== 1) return [];
+      scope = query.active ? collectionNodes(collectionChildren(matches[0])) : collectionChildren(matches[0]);
+      scope = scope.filter((node) =>
+        collectionModel(node).organizationId === collectionModel(matches[0]).organizationId);
+    } else if (!query.active) {
+      scope = tree ?? [];
+    }
+    const terms = searchTerms(query.text);
+    const seen = new Set();
+    return scope.map(collectionModel).filter((model) => {
+      if (!model.organizationId || model.id === "unassigned" ||
+          (filter.organizationId !== undefined && model.organizationId !== filter.organizationId)) return false;
+      if (query.active) {
+        const path = collectionPath(model);
+        if (path === undefined || !terms.every((term) =>
+          searchTerms(path + " " + model.id).join(" ").includes(term))) return false;
+      }
+      const key = model.organizationId + ":" + model.id;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    }).map((model) => {
+      if (!query.active) return model;
+      // Full paths disambiguate identical leaf names without mutating the decrypted tree.
+      const result = copy(model);
+      result.name = collectionPath(model);
+      return result;
+    });
+  }
+
+  async function searchAuthorizedCiphers(service, userId, organizationId, all, filter, text,
+    collections, makeFilter, restricted = false) {
+    const query = vaultQuery(text);
+    if (!query.active) return restricted ? [] : all.filter(makeFilter(filter));
+    if (restricted && (filter.collectionId === undefined ||
+        allCollectionsSelected(filter.collectionId) || filter.collectionId === "unassigned")) return [];
+    const predicate = collectionSearchFilter(filter, collections, makeFilter, restricted);
+    // Advanced indexes are cached per account/org: always pass the complete authorized snapshot.
+    const candidates = new Set(all);
+    const results = query.advanced
+      ? await service.searchCiphers(userId, organizationId, query.text, all)
+      : service.searchCiphersBasic(all, query.text);
+    const seen = new Set();
+    return results.filter((cipher) => {
+      if (!candidates.has(cipher) || !predicate(cipher) || seen.has(cipher.id)) return false;
+      seen.add(cipher.id);
+      return true;
+    });
+  }
+
   async function searchVaultCiphers(component, userId, ciphers, filter, text, collectionTree,
     makeFilter, firstValueFrom) {
     const failed = await firstValueFrom(component.cipherService.failedToDecryptCiphers$(userId)) ?? [];
     const all = [...failed, ...ciphers];
-    if (!await component.searchService.isSearchable(text)) return all.filter(makeFilter(filter));
-
-    const predicate = collectionSearchFilter(filter, collectionTree, makeFilter);
-    // Keep the complete authorized snapshot as input: the upstream advanced-search index is
-    // cached per account, not per collection. Subset indexing could leave other scopes stale.
-    const candidates = new Set(all);
-    const results = await component.searchService.searchCiphers(userId, null, text, all);
-    return results.filter((cipher) => candidates.has(cipher) && predicate(cipher));
+    return searchAuthorizedCiphers(component.searchService, userId, null, all, filter, text,
+      collectionTree, makeFilter);
   }
 
   async function searchOrganizationVaultCiphers(component, userId, organizationId, ciphers,
     filter, text, collections, restricted, makeFilter) {
-    if (!userId || !organizationId || filter.organizationId !== organizationId ||
-        (filter.collectionId === undefined && filter.type === undefined)) return [];
+    if (!userId || !organizationId || filter.organizationId !== organizationId) return [];
+    if (!vaultQuery(text).active && filter.collectionId === undefined && filter.type === undefined) return [];
     const all = (ciphers ?? []).filter((cipher) => cipher.organizationId === organizationId);
-    if (!await component.searchService.isSearchable(text)) {
-      return restricted ? [] : all.filter(makeFilter(filter));
+    return searchAuthorizedCiphers(component.searchService, userId, organizationId, all, filter,
+      text, collections, makeFilter, restricted);
+  }
+
+  function vaultSearchPresentation(hash, title, searchText) {
+    const [path, query = ""] = hash.split("?");
+    const params = new URLSearchParams(query);
+    if (typeof searchText === "string") {
+      if (vaultQuery(searchText).active) params.set("search", searchText);
+      else params.delete("search");
     }
-    if (restricted && (filter.collectionId === undefined ||
-        filter.collectionId === "all" || filter.collectionId === "unassigned")) return [];
-    const predicate = collectionSearchFilter(filter, collections, makeFilter, restricted);
-    // The directory defines paths, never access. Intersect with this exact authorized snapshot,
-    // not just IDs that a stale search index could return with different contents or grants.
-    const candidates = new Set(all);
-    const results = await component.searchService.searchCiphers(userId, organizationId, text, all);
-    return results.filter((cipher) => candidates.has(cipher) && predicate(cipher));
+    const collectionId = params.get("sharedFolderId") ?? params.get("collectionId");
+    const org = params.get("organizationId") ?? params.get("vaultId");
+    const admin = /^#\/organizations\/[^/]+\/vault(?:\/|$)/.test(path);
+    const types = { all: "所有项目", favorites: "收藏夹", login: "登录", card: "支付卡",
+      identity: "身份", note: "安全笔记", sshKey: "SSH 密钥", bankAccount: "银行账户",
+      driversLicense: "驾照", passport: "护照", trash: "回收站", archive: "归档" };
+    const selectedType = types[params.get("type")];
+    let scope = title || (admin ? "当前组织" : "所有密码库");
+    if (collectionId === "unassigned") scope += " · 未分配集合";
+    else if (allCollectionsSelected(collectionId)) scope += " · 所有集合";
+    else if (collectionId) scope += "（含子集合）";
+    else if (org === "unassigned") scope = "我的密码库";
+    if (selectedType && selectedType !== title) scope += " · " + selectedType;
+    const reset = new URLSearchParams();
+    if (params.has("search")) reset.set("search", params.get("search"));
+    // Do not turn a trash/archive query into an active-vault query, or cross an admin org boundary.
+    if (["trash", "archive"].includes(params.get("type"))) reset.set("type", params.get("type"));
+    else if (admin) reset.set("type", "all");
+    const href = path + (reset.size ? "?" + reset : "");
+    const scoped = !!collectionId || !!org || params.has("folderId") ||
+      (!!selectedType && !["all", "trash", "archive"].includes(params.get("type")));
+    return { scope: "范围：" + scope, href, expanded: scoped,
+      expandLabel: admin ? "搜索整个组织" : "搜索全部密码库",
+      hint: vaultQuery(params.get("search")).advanced
+        ? "高级搜索仅匹配项目字段，仍遵循当前范围和访问权限。"
+        : "输入即搜索项目和集合名称，仅显示有权访问的内容。" };
+  }
+
+  function renderVaultSearch() {
+    const vault = win.document.querySelector("main#main-content app-vault, main#main-content app-org-vault");
+    if (!vault) return;
+    const header = vault.querySelector("app-vault-header, app-org-vault-header");
+    const crumbs = [...(header?.querySelectorAll('a[href^="#"]') ?? [])]
+      .filter((link) => !link.classList.contains("vw-vault-search-expand"))
+      .map((link) => link.textContent.trim().replace(/\s+/g, " "));
+    const heading = header?.querySelector("h1")?.textContent.trim().replace(/\s+/g, " ");
+    const title = [...crumbs, heading].filter(Boolean).join(" / ");
+    for (const input of searchInputs()) {
+      if (!vault.contains(input)) continue;
+      const host = input.closest("bit-search");
+      if (!host) continue;
+      host.classList.add("vw-unified-search");
+      const presentation = vaultSearchPresentation(win.location.hash, title, input.value);
+      let panel = host.querySelector(".vw-vault-search-context");
+      if (!panel) {
+        panel = element("div", "vw-vault-search-context");
+        const scope = element("p", "vw-vault-search-scope");
+        const hint = element("p", "vw-vault-search-hint");
+        const expand = element("a", "vw-vault-search-expand");
+        expand.addEventListener("click", () => {
+          expand.setAttribute("href", vaultSearchPresentation(win.location.hash, title, input.value).href);
+        });
+        panel.append(scope, hint, expand);
+        host.append(panel);
+        scope.id = input.id + "-vw-scope";
+        hint.id = input.id + "-vw-help";
+        const describedBy = new Set((input.getAttribute("aria-describedby") || "").split(/\s+/).filter(Boolean));
+        describedBy.add(scope.id);
+        describedBy.add(hint.id);
+        input.setAttribute("aria-describedby", [...describedBy].join(" "));
+      }
+      const [scope, hint, expand] = panel.children;
+      if (scope.textContent !== presentation.scope) scope.textContent = presentation.scope;
+      if (scope.getAttribute("title") !== presentation.scope) scope.setAttribute("title", presentation.scope);
+      if (hint.textContent !== presentation.hint) hint.textContent = presentation.hint;
+      if (expand.textContent !== presentation.expandLabel) expand.textContent = presentation.expandLabel;
+      if (expand.getAttribute("href") !== presentation.href) expand.setAttribute("href", presentation.href);
+      expand.hidden = !presentation.expanded;
+      if (input.getAttribute("aria-label") !== "搜索密码库") input.setAttribute("aria-label", "搜索密码库");
+    }
   }
 
   function descendantRows(original, descendants) {
@@ -1262,6 +1406,7 @@
       scheduled = false;
       updateLayout();
       updateAdminListLayout();
+      renderVaultSearch();
       renderCipherRows();
       for (const state of memberSelectors.values()) renderMemberCollectionSelector(state);
       for (const state of dialogs.values()) {
@@ -1301,6 +1446,7 @@
       }
       if (!target?.closest(
         'app-vault-filter .filter-button, app-organization-vault-filter .filter-button,' +
+        'app-vault-header a:not(.vw-vault-search-expand), app-org-vault-header a:not(.vw-vault-search-expand),' +
         '.vw-results-pane tr[appvaultcollectionrow] button[bitlink]')) return;
       // Let RouterLink handle this click before a form update can recreate its row.
       win.setTimeout(() => {
@@ -1313,7 +1459,8 @@
     }, true);
     win.document.addEventListener("input", (event) => {
       const input = event.target;
-      if (!input?.matches?.('.vw-admin-list-header input[type="search"]')) return;
+      if (input?.closest?.("app-vault-filter, app-organization-vault-filter, app-org-vault-header")) schedule();
+      if (!input?.matches?.('.vw-admin-list-header bit-search input[name="searchText"]')) return;
       const main = input.closest("main");
       if (main) {
         main.scrollTop = 0;
@@ -1328,8 +1475,8 @@
   return { start, registerScrollHost, unregisterScrollHost, registerCollectionDialog,
     saveCollection, createCollection, collectionPathError, nestedCollectionTraverse,
     planCollectionUpdate, accessDelta, applyDelta, isDescendant, navigationKey,
-    searchMatchesInput, collectionSearchFilter, searchVaultCiphers,
-    searchOrganizationVaultCiphers,
+    searchMatchesInput, collectionSearchFilter, searchVaultCiphers, searchVaultCollections,
+    searchOrganizationVaultCiphers, vaultQuery, vaultSearchPresentation,
     descendantRows, selectionState, toggleSelection, revocationCandidates,
     cloneSourceWithoutItemAccess, itemGrants, saveItemAccess,
     memberCollectionRows, planMemberCollectionAccess, applyMemberCollectionAccess,

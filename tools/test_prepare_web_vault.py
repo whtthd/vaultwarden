@@ -176,6 +176,7 @@ const component = {
   cipherService: { failedToDecryptCiphers$: () => [] },
   searchService: {
     isSearchable: async text => !!text?.trim(),
+    searchCiphersBasic: (candidates) => { searches++; return candidates; },
     searchCiphers: async (user, org, text, candidates) => { searches++; return candidates; },
   },
 };
@@ -207,6 +208,10 @@ async function search(filter = {}, account = { id: 'active-user' }, tree = nodes
   assert.deepEqual(await search({ type: 'archive' }), ['archived']);
   assert.deepEqual(await search({ type: 'trash' }), ['deleted']);
   assert.deepEqual(await search({ organizationId: 'other' }), []);
+  assert.deepEqual(await search({ collectionId: 'all', organizationId: 'org' }),
+    ['login', 'favorite', 'folder', 'note', 'card', 'sibling']);
+  assert.deepEqual(await search({ collectionId: 'all', organizationId: 'org', type: 'trash' }), ['deleted']);
+  assert.deepEqual(await search({ collectionId: 'all' }, { id: 'active-user' }, nodes, ''), []);
   assert.deepEqual(await search({}, undefined, []), []);
   assert.deepEqual(await search({}, undefined, nodes, ''), []);
   const before = searches;
@@ -245,6 +250,7 @@ const makeFilter = vm.runInNewContext('(' + input.factory + ')', {
 let searches = 0;
 const component = { searchService: {
   isSearchable: async text => !!text?.trim(),
+  searchCiphersBasic: (candidates) => { searches++; return [...candidates, { ...candidates[0] }]; },
   searchCiphers: async (user, org, text, candidates) => {
     searches++;
     assert.equal(user, 'user');
@@ -279,12 +285,69 @@ async function search({ filter = {}, text = 'demo', restricted = false,
   assert.deepEqual(await search({ filter: { collectionId: 'missing' } }), []);
   assert.deepEqual(await search({ collections: [] }), []);
   assert.deepEqual(await search({ filter: { organizationId: 'foreign' } }), []);
+  assert.deepEqual(await search({ filter: { collectionId: undefined } }),
+    ['parent-item', 'child-item', 'note', 'sibling']);
+  assert.deepEqual(await search({ filter: { collectionId: 'all' }, text: 'd' }),
+    ['parent-item', 'child-item', 'note', 'sibling']);
   const before = searches;
   assert.deepEqual(await search({ account: null }), []);
   assert.deepEqual(await search({ account: { id: 'other' } }), []);
   assert.deepEqual(await search({ account: { id: 'other' }, user: 'other' }), []);
   assert.equal(searches, before);
 })().catch(error => { console.error(error); process.exitCode = 1; });
+"""
+        result = subprocess.run(
+            ['node', '-e', script], input=payload, text=True, capture_output=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr[-3000:])
+
+    @unittest.skipUnless(shutil.which('node'), 'Node.js is needed for directory search integration')
+    def test_both_compiled_directory_projections_use_one_matcher_and_guard_accounts(self):
+        patched_main = patch_bundle(self.bundle)
+        asset = next(iter(ORIGINAL_LAZY_ASSETS))
+        patched_admin = patch_lazy_bundle((ROOT / 'web-vault' / asset).read_bytes(), asset)
+        personal = re.findall(
+            rb'\(0,g\.T\)\((\(\[t,i,n,r\]\)=>r\?\.id===e\?'
+            rb'window\.VaultwardenEnhancements\.searchVaultCollections\(t,i,n\):\[\])\)', patched_main)
+        admin = re.findall(
+            rb'\(0,r\.T\)\((\(\[e,t,i,n,s,o,u,h\]\)=>\{.*?'
+            rb'return n===Ot\.AddAccess.*?\{collections:a,showAddAccessToggle:l\}\})\)', patched_admin)
+        self.assertEqual(len(personal), 1)
+        self.assertEqual(len(admin), 1)
+        self.assertIn(b'get searchPlaceholder(){return"searchVault"}', patched_main)
+        self.assertIn(b'get searchPlaceholder(){return"searchVault"}', patched_admin)
+        self.assertNotIn(b'"searchCollection","searchSharedFolder"', patched_admin)
+        payload = json.dumps({
+            'personal': personal[0].decode(), 'admin': admin[0].decode(),
+            'runtime': str(ROOT / 'web-vault-custom/enhancements.js'),
+        })
+        script = r"""
+const fs = require('node:fs'), vm = require('node:vm'), assert = require('node:assert/strict');
+const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+const context = { window: { VaultwardenEnhancements: require(input.runtime) }, e: 'user',
+  Ot: { AddAccess: 1 } };
+const personal = vm.runInNewContext('(' + input.personal + ')', context);
+const admin = vm.runInNewContext('(' + input.admin + ')', context);
+const node = (id, fullName, children = []) =>
+  ({ node: { id, fullName, name: fullName.split('/').pop(), organizationId: 'org' }, children });
+const tree = [node('parent', 'A', [node('child', 'A/密')]), node('other', 'Other')];
+const filter = { organizationId: 'org', collectionId: 'all' };
+const org = { id: 'org', allowAdminAccessToAllCollectionItems: false, canEditUnmanagedCollections: true };
+const ids = rows => Array.from(rows, r => r.id);
+const run = (account = { id: 'user' }, user = 'user', organization = org, text = ' 密 ') => {
+  const a = admin([tree, filter, text, 0, user, organization, account, 'user']);
+  return { p: ids(personal([tree, filter, text, account])), a: ids(a.collections) };
+};
+assert.deepEqual(run(), { p: ['child'], a: ['child'] });
+assert.deepEqual(run(null), { p: [], a: [] });
+assert.deepEqual(run({ id: 'other' }, 'other'), { p: [], a: [] });
+assert.deepEqual(run({ id: 'user' }, 'user', { ...org, id: 'foreign' }).a, []);
+assert.deepEqual(run({ id: 'user' }, 'user', org, ' >name:demo '), { p: [], a: [] });
+tree[0].children[0].node.unmanaged = true;
+const add = admin([tree, filter, '', 1, 'user', org, { id: 'user' }, 'user']);
+assert.equal(add.showAddAccessToggle, false);
+const found = admin([tree, filter, '密', 1, 'user', org, { id: 'user' }, 'user']);
+assert.equal(found.showAddAccessToggle, true);
+assert.deepEqual(ids(found.collections), ['child']);
 """
         result = subprocess.run(
             ['node', '-e', script], input=payload, text=True, capture_output=True, check=False)

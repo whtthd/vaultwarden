@@ -254,6 +254,10 @@ function searchComponent(results, checkInput = () => {}, failed = []) {
     } },
     searchService: {
       isSearchable: async (text) => !!text?.trim(),
+      searchCiphersBasic: (candidates, text) => {
+        checkInput(candidates, text);
+        return results;
+      },
       searchCiphers: async (userId, organizationId, text, candidates) => {
         assert.equal(userId, 'search-user');
         assert.equal(organizationId, null);
@@ -355,8 +359,8 @@ test('failed collection-name decryption permits direct search but cannot invent 
   assert.equal(root(searchCipher('failed-child-item', ['failed-child'])), false);
 });
 
-test('all, unassigned and non-collection search preserve the original predicate unchanged', () => {
-  for (const collectionId of [undefined, 'all', 'unassigned']) {
+test('unassigned and non-collection search preserve the original predicate unchanged', () => {
+  for (const collectionId of [undefined, 'unassigned']) {
     const filter = { collectionId, type: 'login', folderId: 'folder' };
     const sentinel = () => 'original-result';
     const predicate = enhancements.collectionSearchFilter(filter, undefined, (received) => {
@@ -394,9 +398,7 @@ test('admin collection search accepts a flat catalog while remaining inside the 
   const component = {
     searchService: {
       isSearchable: async () => true,
-      searchCiphers: async (user, org, text, candidates) => {
-        assert.equal(user, 'admin-user');
-        assert.equal(org, 'org');
+      searchCiphersBasic: (candidates, text) => {
         assert.equal(text, 'secret');
         return [...candidates, { ...candidates[1] }, searchCipher('forged', ['child'])];
       },
@@ -417,7 +419,7 @@ test('admin collection search fails closed when its collection snapshot is unava
   const component = {
     searchService: {
       isSearchable: async () => true,
-      searchCiphers: async () => [searchCipher('visible', ['child'])],
+      searchCiphersBasic: () => [searchCipher('visible', ['child'])],
     },
   };
   const result = await enhancements.searchOrganizationVaultCiphers(
@@ -433,8 +435,7 @@ test('admin search retains direct browsing without a searchable query and blocks
   const parent = searchCipher('parent-item', ['parent']);
   const child = searchCipher('child-item', ['child']);
   const component = { searchService: {
-    isSearchable: async (text) => !!text,
-    searchCiphers: async (user, org, text, ciphers) => ciphers,
+    searchCiphersBasic: (ciphers) => ciphers,
   } };
   async function search(text, restricted, filter = {}) {
     return enhancements.searchOrganizationVaultCiphers(component, 'user', 'org', [parent, child],
@@ -446,7 +447,7 @@ test('admin search retains direct browsing without a searchable query and blocks
   assert.deepEqual(await search('match', false), [parent, child]);
   assert.deepEqual(await search('match', true), [child]);
   assert.deepEqual(await search('match', false, { organizationId: 'foreign' }), []);
-  assert.deepEqual(await search('match', false, { collectionId: undefined }), []);
+  assert.deepEqual(await search('match', false, { collectionId: undefined }), [parent, child]);
   assert.deepEqual(await search('match', true, { collectionId: undefined, type: 'all' }), []);
 });
 
@@ -455,8 +456,7 @@ test('admin scopes do not index cross-organization records or return stale ciphe
   const allowed = searchCipher('allowed', ['child']);
   const foreign = searchCipher('foreign', ['child'], { organizationId: 'foreign' });
   const component = { searchService: {
-    isSearchable: async () => true,
-    searchCiphers: async (user, org, text, ciphers) => {
+    searchCiphersBasic: (ciphers) => {
       assert.deepEqual(ciphers, [allowed]);
       return [foreign, { ...allowed }, allowed];
     },
@@ -489,16 +489,138 @@ test('basic and advanced collection searches keep the full authorized input and 
   }
 });
 
-test('empty, whitespace and non-searchable queries retain direct-only collection browsing', async () => {
+test('empty and whitespace queries retain direct-only collection browsing', async () => {
   const nodes = tree([collection('parent', 'A'), collection('child', 'A/B')]);
   const parent = searchCipher('parent-item', ['parent']);
   const child = searchCipher('child-item', ['child']);
   const component = searchComponent([], () => assert.fail('search must not run'));
-  component.searchService.isSearchable = async () => false;
-  for (const query of [undefined, '', '   ', 'x']) {
+  for (const query of [undefined, '', '   ']) {
     assert.deepEqual(await enhancements.searchVaultCiphers(component, 'search-user', [parent, child],
       { collectionId: 'parent' }, query, nodes, originalSearchFilter, async (value) => value), [parent]);
   }
+});
+
+test('single Latin and CJK characters use basic matching consistently in every vault scope', async () => {
+  const models = tree([collection('parent', 'A'), collection('child', 'A/B')]);
+  const parent = searchCipher('parent-item', ['parent']);
+  const child = searchCipher('child-item', ['child']);
+  const all = [parent, child];
+  const component = searchComponent([child], (candidates) => assert.deepEqual(candidates, all));
+  // The upstream locale-dependent minimum is not used by the unified basic search.
+  component.searchService.isSearchable = async () => assert.fail('locale must not decide query scope');
+  component.searchService.searchCiphers = async () => assert.fail('basic search must not build an index');
+  for (const query of [' x ', ' 密 ']) {
+    assert.deepEqual(await enhancements.searchVaultCiphers(component, 'search-user', all,
+      { collectionId: 'parent' }, query, models, originalSearchFilter, async (v) => v), [child]);
+    assert.deepEqual(await enhancements.searchOrganizationVaultCiphers(component, 'search-user', 'org', all,
+      { organizationId: 'org', collectionId: 'parent' }, query, models, false, originalSearchFilter), [child]);
+  }
+});
+
+test('all-collection queries search organization items while leaving personal items and other filters out', () => {
+  const selected = { collectionId: 'all', organizationId: 'org', type: 'login' };
+  const predicate = enhancements.collectionSearchFilter(selected, [], (filter) => {
+    assert.deepEqual(filter, { ...selected, collectionId: undefined });
+    return (cipher) => cipher.organizationId === filter.organizationId && cipher.type === 1;
+  });
+  const ciphers = [searchCipher('visible', ['leaf']), searchCipher('unassigned', []),
+    searchCipher('foreign', ['leaf'], { organizationId: 'other' }),
+    searchCipher('personal', [], { organizationId: null }), searchCipher('note', ['leaf'], { type: 2 })];
+  assert.deepEqual(ciphers.filter(predicate).map((cipher) => cipher.id), ['visible', 'unassigned']);
+  assert.equal(selected.collectionId, 'all');
+});
+
+test('collection names use the same trimmed single-character and multi-term rules in both vaults', () => {
+  const models = tree([collection('root', 'Café'), collection('child', 'Café/密钥'),
+    collection('other', 'Other'), collection('foreign', 'Café/密钥', { organizationId: 'foreign' })]);
+  for (const admin of [false, true]) {
+    for (const collectionId of [undefined, 'all']) {
+      const ids = (text) => enhancements.searchVaultCollections(models,
+        { collectionId, organizationId: 'org' }, text, admin).map((c) => c.id);
+      assert.deepEqual(ids(' 密 '), ['child']);
+      assert.deepEqual(ids('  cafe   密 '), ['child']);
+      assert.deepEqual(ids('CAFÉ'), ['root', 'child']);
+      assert.deepEqual(ids(' >name:密 '), []);
+      assert.deepEqual(ids('missing'), []);
+    }
+  }
+});
+
+test('directory search retains exact subtree, org, missing-selection and noncollection boundaries', () => {
+  const models = tree([collection('root', 'A'), collection('child', 'A/Allowed'),
+    collection('deep', 'A/Allowed/Deep'), collection('sibling', 'AB/Allowed'),
+    collection('foreign', 'A/Allowed', { organizationId: 'foreign' })]);
+  for (const admin of [false, true]) {
+    const run = (filter, query = 'allowed') =>
+      enhancements.searchVaultCollections(models, { collectionId: 'root', ...filter }, query, admin)
+        .map((c) => c.id);
+    assert.deepEqual(run({}), ['child', 'deep']);
+    assert.deepEqual(run({ collectionId: 'missing' }), []);
+    assert.deepEqual(run({ organizationId: 'foreign' }), []);
+    assert.deepEqual(run({ organizationId: 'unassigned' }), []);
+    assert.deepEqual(run({ folderId: 'folder' }), []);
+    assert.deepEqual(run({ type: 'login' }), []);
+    assert.deepEqual(run({ type: 'trash' }), []);
+    assert.deepEqual(run({}, ''), ['child']);
+  }
+  assert.deepEqual(enhancements.searchVaultCollections(models, {}, ''), []);
+  assert.deepEqual(enhancements.searchVaultCollections(models, { organizationId: 'org' }, '', true)
+    .map((c) => c.id), ['root', 'vw-ancestor:org:AB']);
+  assert.deepEqual(enhancements.searchVaultCollections(models, { organizationId: 'org', type: 'all' }, '', true), []);
+});
+
+test('matching collection rows display full paths while preserving IDs and the decrypted source tree', () => {
+  const models = tree([collection('one', 'A/Service'), collection('two', 'B/Service')]);
+  const before = models.map((node) => node.children[0].node.name);
+  const result = enhancements.searchVaultCollections(models, {}, 'service');
+  assert.deepEqual(result.map((c) => [c.id, c.name]), [['one', 'A/Service'], ['two', 'B/Service']]);
+  assert.deepEqual(models.map((node) => node.children[0].node.name), before);
+  assert.equal(result[0].canEdit(), true);
+  assert.equal(result[0].externalId, 'external-one');
+});
+
+test('single-item search results are deduplicated and never accept stale or forged instances', async () => {
+  const nodes = tree([collection('root', 'A')]);
+  const item = searchCipher('one', ['root']);
+  const component = searchComponent([item, item, { ...item }, searchCipher('forged', ['root'])]);
+  for (const text of ['demo', '>name:demo']) {
+    assert.deepEqual(await enhancements.searchVaultCiphers(component, 'search-user', [item],
+      { collectionId: 'root' }, text, nodes, originalSearchFilter, async (v) => v), [item]);
+  }
+});
+
+test('search scope presentation keeps queries but only widens scope after an explicit link', () => {
+  const selected = enhancements.vaultSearchPresentation(
+    '#/vault?organizationId=org&collectionId=child&type=login&search=hello%20world&cipherId=private', 'A/B');
+  assert.equal(selected.scope, '范围：A/B（含子集合） · 登录');
+  assert.equal(selected.expanded, true);
+  assert.equal(selected.href, '#/vault?search=hello+world');
+  assert.equal(selected.expandLabel, '搜索全部密码库');
+  const admin = enhancements.vaultSearchPresentation(
+    '#/organizations/org/vault?collectionId=child&search=demo', 'Child');
+  assert.equal(admin.href, '#/organizations/org/vault?search=demo&type=all');
+  assert.equal(admin.expandLabel, '搜索整个组织');
+  const trash = enhancements.vaultSearchPresentation(
+    '#/vault?collectionId=child&type=trash&search=deleted', 'Child');
+  assert.equal(trash.href, '#/vault?search=deleted&type=trash');
+  assert.equal(enhancements.vaultSearchPresentation('#/vault', '所有密码库').expanded, false);
+  assert.match(enhancements.vaultSearchPresentation('#/vault?search=%3Ename%3Ademo').hint, /高级搜索/);
+  assert.equal(enhancements.vaultSearchPresentation('#/vault?collectionId=child&search=old', 'Child', 'new').href,
+    '#/vault?search=new');
+  assert.equal(enhancements.vaultSearchPresentation('#/vault?collectionId=child&search=old', 'Child', '').href,
+    '#/vault');
+});
+
+test('Safari text inputs participate in the same debounce and navigation clearing guards', () => {
+  const input = { value: 'demo' };
+  const document = { querySelectorAll: (selector) => {
+    assert.ok(selector.includes('bit-search input[name="searchText"]'));
+    assert.ok(!selector.includes('type="search"'));
+    return [input];
+  } };
+  assert.equal(enhancements.searchMatchesInput('demo', document), true);
+  input.value = '';
+  assert.equal(enhancements.searchMatchesInput('demo', document), false);
 });
 
 test('authorized failed-decryption rows are retained without accepting rows outside either account feed', async () => {

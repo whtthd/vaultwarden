@@ -62,6 +62,13 @@ main#main-content.vw-admin-list-page {
   padding-bottom: 1rem;
   background: var(--color-bg-primary);
 }
+.vw-unified-search { display: block; min-width: 0; }
+.vw-vault-search-context { font-size: 0.75rem; line-height: 1.5; margin-top: 0.65rem; min-width: 0; }
+.vw-vault-search-scope { font-weight: 600; margin: 0; overflow-wrap: anywhere; }
+.vw-vault-search-hint { color: var(--color-fg-body-subtle); margin: 0.25rem 0; }
+.vw-vault-search-expand { color: var(--color-fg-brand); display: inline-block; padding-block: 0.2rem; text-decoration: underline; }
+.vw-vault-search-expand[hidden] { display: none; }
+.vw-vault-search-expand:focus-visible { outline: 2px solid var(--color-bg-brand); outline-offset: 2px; }
 .vw-descendant-access {
   border: 1px solid rgb(var(--color-secondary-300));
   border-radius: 0.375rem;
@@ -141,7 +148,11 @@ main#main-content.vw-admin-list-page {
 @media (max-width: 767px) {
   .vw-vault-panes { flex-direction: column; gap: 1rem; }
   .vw-vault-panes > .vw-filter-pane { flex: 0 0 35%; max-width: 100%; }
-  .vw-vault-panes > .vw-results-pane { flex: 1 1 0; max-width: 100%; }
+  .vw-vault-panes > .vw-results-pane { flex: 1 1 0; max-width: 100%; width: 100%; }
+  .vw-vault-search-context { align-items: center; column-gap: 0.5rem; display: grid; grid-template-columns: minmax(0, 1fr) auto; }
+  .vw-vault-search-scope { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .vw-vault-search-hint { display: none; }
+  .vw-vault-search-expand { padding-block: 0; }
   .vw-access-row { gap: 0.5rem; padding-left: calc(var(--vw-depth) * 0.5rem); }
   .vw-item-member { align-items: stretch; grid-template-columns: 1fr; }
   .vw-member-collection-panel { padding: 0.75rem; }

@@ -27,11 +27,28 @@ For Chinese usage instructions and permission cautions, see
 - Selecting a collection, folder, organization or item type clears the previous
   text search. Following a collection from search results also clears it. A
   pending search debounce cannot restore text cleared by navigation.
-- A searchable query inside a personal-vault collection includes that collection and its
+- Vaults share one search entry and cipher-search pipeline, with a stable
+  placeholder and a separate visible scope. Personal, organization and collection
+  views retain their selected filters. An explicit expansion link preserves the
+  latest input, even before its debounce completes; personal views can expand to
+  the account's authorized vaults, while Admin Console stays in the route's
+  organization. Trash and archive expansions retain their status.
+- Any nonblank basic query, including a single Latin or CJK character, searches
+  immediately. The upstream basic matcher retains its existing item fields and
+  case/diacritic-insensitive, multi-term matching. Collection names use the same
+  whitespace, case, diacritic and term rules against full paths and IDs, with full
+  paths displayed on copied result views. The decrypted source tree is unchanged.
+  Advanced queries still use the upstream authorized index and return items only.
+  Item type, favorites, folder, archive and trash filters do not return directories.
+  Both directory projections are synchronous and guard the current account.
+  The admin projection additionally guards the organization and preserves its
+  unmanaged-collection toggle. Safari text inputs use the same input and clearing
+  guards as search inputs in other browsers.
+- A nonblank query inside a personal-vault collection includes that collection and its
   descendants at every depth, intersected with the current account's authorized
   cipher snapshot. The scope comes only from that account's decrypted collection
   tree, never from the admin catalog or a new server-side search. Empty or
-  non-searchable queries retain direct-only browsing. All other upstream filter
+  whitespace-only queries retain direct-only browsing. All other upstream filter
   conditions still apply. Structural parents include accessible descendants
   without granting access to the real parents; path-segment and organization
   boundaries prevent sibling, similar-prefix and cross-organization matches.
@@ -42,6 +59,10 @@ For Chinese usage instructions and permission cautions, see
   advanced search retain the complete authorized input snapshot, avoiding a
   stale per-account advanced-search index after switching collection scopes;
   returned results are intersected with the same snapshot before scope filtering.
+- Organization landing pages and all-collection views search authorized items as
+  well as directory names. All-collection queries exclude personal items.
+  Empty-query browsing keeps the original directory-only behavior where applicable;
+  the underlying upstream filter factory remains unchanged.
 - Organization-vault search consumes the decrypted nested collection snapshot,
   including structural ancestors. Restricted parents contribute accessible
   descendants only, not direct parent items. A switchMap projection rejects
@@ -239,7 +260,10 @@ Recursive-search tests cover deep descendants, structural parents, exact path
 and organization boundaries, duplicate paths, Unicode/case-sensitive hierarchy,
 unauthorized candidates, multi-collection membership, failed name decryption,
 revoked/missing scopes, account isolation, unchanged non-collection filters and
-direct-only browsing without a searchable query. Basic and advanced queries use
+direct-only browsing without a nonblank query. Unified-search tests additionally
+cover single-character input, normalized multi-term path matching, full-path
+result views, scope expansion before debounce, preserved trash/archive status,
+Safari inputs, and both actual compiled directory projections. Basic and advanced queries use
 the same authorized candidate set; forged or stale search results are rejected.
 Preparation tests
 cover every pinned hook, both collection terminology modes, idempotence, resource
