@@ -43,6 +43,22 @@ main#main-content.vw-admin-list-page {
   scrollbar-gutter: stable;
 }
 .vw-vault-panes > .vw-results-pane { min-width: 0; }
+/* Use the name cell instead of the upstream 14rem cap; keep virtual rows on one line. */
+app-vault-items tr[appvaultcollectionrow] > td:nth-child(3) > .tw-flex { min-width: 0; }
+app-vault-items tr[appvaultcollectionrow] > td:nth-child(3) button[bitlink] {
+  flex: 1 1 0;
+  min-width: 0;
+  max-width: 100%;
+}
+app-vault-items tr[appvaultcollectionrow] > td:nth-child(3) button[bitlink] > .tw-flex,
+app-vault-items tr[appvaultcollectionrow] > td:nth-child(3) button[bitlink] > .tw-flex > span,
+app-vault-items tr[appvaultcollectionrow] > td:nth-child(3) button[bitlink] .tw-truncate {
+  min-width: 0;
+  max-width: 100%;
+}
+app-vault-items tr[appvaultcollectionrow] > td:nth-child(3) > .tw-flex > [bitbadge] {
+  flex-shrink: 0;
+}
 .vw-filter-pane:focus-visible,
 .vw-results-pane:focus-visible { outline: 2px solid currentColor; outline-offset: -2px; }
 /* Keep the filter title and search field available while the collection tree scrolls. */
