@@ -142,6 +142,26 @@ ENHANCEMENT_PATCHES = [
         'window.VaultwardenEnhancements.createCollection(this,c,u,v._)',
     ),
     (
+        'fromCollectionResponse(t,this.encryptService,i[e])}));return yield Promise.all(n)})}encrypt(e,t,i)',
+        'fromCollectionResponse(t,this.encryptService,i[e])}));'
+        'return window.VaultwardenEnhancements.rememberCollectionSnapshot(yield Promise.all(n),t)})}encrypt(e,t,i)',
+    ),
+    (
+        '86079(e,t,i){"use strict";i.d(t,{X:()=>hi});var n=i(68108)',
+        '86079(e,t,i){"use strict";i.d(t,{X:()=>hi});'
+        'const vwImportInject=i(11217).WQX,vwImportOrg=i(67553).PV,vwImportCollections=i(21571).vE;'
+        'var n=i(68108)',
+    ),
+    (
+        'this.sdkService=u,this.importOptions=ii.eV,this.sdkImporters=',
+        'this.sdkService=u,this.vwOrganizations=vwImportInject(vwImportOrg),'
+        'this.vwCollections=vwImportInject(vwImportCollections),this.importOptions=ii.eV,this.sdkImporters=',
+    ),
+    (
+        'yield this.importApiService.postImportOrganizationCiphers(t,r)',
+        'yield window.VaultwardenEnhancements.importOrganization(this,t,i,e.collections,r,n._)',
+    ),
+    (
         'this.selectionList.formArray.disabled?t([]):t(e))})}registerOnChange(e)',
         'this.selectionList.formArray.disabled?t([]):t(e))}),'
         'window.VaultwardenEnhancements.registerMemberCollectionSelector(this,(0,r.WQX)(w.aKT).nativeElement)}'

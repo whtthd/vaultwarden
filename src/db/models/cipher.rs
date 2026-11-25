@@ -25,8 +25,19 @@ use macros::UuidFromParam;
 
 use super::{
     Archive, Attachment, CollectionCipher, CollectionId, Favorite, FolderCipher, FolderId, Group, Membership,
-    MembershipStatus, OrganizationId, User, UserId, organization::ORG_ADMIN_ATYPES,
+    MembershipStatus, OrganizationId, User, UserId, collection::inherited_collection_ids,
+    organization::ORG_ADMIN_ATYPES,
 };
+
+// An inherited grant can reveal a password, but cannot confer editing or management.
+fn with_inherited_read(existing: Option<(bool, bool, bool)>, inherited: bool) -> Option<(bool, bool, bool)> {
+    if inherited {
+        let (read_only, _, manage) = existing.unwrap_or((true, false, false));
+        Some((read_only, false, manage))
+    } else {
+        existing
+    }
+}
 
 #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
 #[diesel(table_name = ciphers)]
@@ -176,10 +187,26 @@ impl Cipher {
             }
         }
 
+        // A full sync already has both sets. For a single-item response also return the
+        // inherited collection IDs, without feeding them into the collection-edit endpoints.
+        let inherited_ids = if sync_type == CipherSyncType::User && cipher_sync_data.is_none() {
+            self.inherited_collections_for_user(user_uuid, conn).await
+        } else {
+            Vec::new()
+        };
+        let inherited_read = match cipher_sync_data {
+            Some(data) => data
+                .cipher_collections
+                .get(&self.uuid)
+                .is_some_and(|ids| ids.iter().any(|id| data.inherited_collections.contains(id))),
+            None => !inherited_ids.is_empty(),
+        };
+
         // We don't need these values at all for Organizational syncs
         // Skip any other database calls if this is the case and just return false.
         let (read_only, hide_passwords, _) = if sync_type == CipherSyncType::User {
-            if let Some((ro, hp, mn)) = self.get_access_restrictions(user_uuid, cipher_sync_data, conn).await {
+            let existing = self.base_access_restrictions(user_uuid, cipher_sync_data, conn).await;
+            if let Some((ro, hp, mn)) = with_inherited_read(existing, inherited_read) {
                 (ro, hp, mn)
             } else {
                 error!("Cipher ownership assertion failure");
@@ -315,7 +342,13 @@ impl Cipher {
                 Cow::from(Vec::new())
             }
         } else {
-            Cow::from(self.get_admin_collections(user_uuid.clone(), conn).await)
+            let mut ids = self.get_admin_collections(user_uuid.clone(), conn).await;
+            for inherited in inherited_ids {
+                if !ids.contains(&inherited) {
+                    ids.push(inherited);
+                }
+            }
+            Cow::from(ids)
         };
 
         // There are three types of cipher response models in upstream
@@ -600,12 +633,9 @@ impl Cipher {
         false
     }
 
-    /// Returns the user's access restrictions to this cipher. A return value
-    /// of None means that this cipher does not belong to the user, and is
-    /// not in any collection the user has access to. Otherwise, the user has
-    /// access to this cipher, and Some(read_only, hide_passwords, manage) represents
-    /// the access restrictions.
-    pub async fn get_access_restrictions(
+    /// Restrictions from ownership, organization membership and direct or group grants.
+    /// Collection reader roles are added only for visibility and password display.
+    async fn base_access_restrictions(
         &self,
         user_uuid: &UserId,
         cipher_sync_data: Option<&CipherSyncData>,
@@ -738,8 +768,25 @@ impl Cipher {
         .await
     }
 
+    async fn inherited_collections_for_user(&self, user_uuid: &UserId, conn: &DbConn) -> Vec<CollectionId> {
+        let Some(org_id) = self.organization_uuid.as_ref() else {
+            return Vec::new();
+        };
+        conn.run(move |conn| {
+            ciphers_collections::table
+                .inner_join(collections::table)
+                .filter(ciphers_collections::cipher_uuid.eq(&self.uuid))
+                .filter(collections::org_uuid.eq(org_id))
+                .filter(collections::uuid.eq_any(inherited_collection_ids(user_uuid.clone())))
+                .select(collections::uuid)
+                .load(conn)
+                .expect("Error loading inherited collections for cipher")
+        })
+        .await
+    }
+
     pub async fn is_write_accessible_to_user(&self, user_uuid: &UserId, conn: &DbConn) -> bool {
-        match self.get_access_restrictions(user_uuid, None, conn).await {
+        match self.base_access_restrictions(user_uuid, None, conn).await {
             Some((read_only, _hide_passwords, manage)) => !read_only || manage,
             None => false,
         }
@@ -748,14 +795,15 @@ impl Cipher {
     // used for checking if collection can be edited (only if user has access to a collection they
     // can write to and also passwords are not hidden to prevent privilege escalation)
     pub async fn is_in_editable_collection_by_user(&self, user_uuid: &UserId, conn: &DbConn) -> bool {
-        match self.get_access_restrictions(user_uuid, None, conn).await {
+        match self.base_access_restrictions(user_uuid, None, conn).await {
             Some((read_only, hide_passwords, manage)) => (!read_only && !hide_passwords) || manage,
             None => false,
         }
     }
 
     pub async fn is_accessible_to_user(&self, user_uuid: &UserId, conn: &DbConn) -> bool {
-        self.get_access_restrictions(user_uuid, None, conn).await.is_some()
+        self.base_access_restrictions(user_uuid, None, conn).await.is_some()
+            || !self.inherited_collections_for_user(user_uuid, conn).await.is_empty()
     }
 
     // Returns whether this cipher is a favorite of the specified user.
@@ -866,6 +914,14 @@ impl Cipher {
                     .filter(ciphers::user_uuid.eq(user_uuid)) // Cipher owner
                     .or_filter(users_organizations::access_all.eq(true)) // access_all in org
                     .or_filter(users_collections::user_uuid.eq(user_uuid)) // Access to collection
+                    .or_filter(
+                        ciphers_collections::collection_uuid.eq_any(
+                            collections::table
+                                .filter(collections::org_uuid.nullable().eq(ciphers::organization_uuid))
+                                .filter(collections::uuid.eq_any(inherited_collection_ids(user_uuid.clone())))
+                                .select(collections::uuid),
+                        ),
+                    )
                     .or_filter(groups::access_all.eq(true)) // Access via groups
                     .or_filter(collections_groups::collections_uuid.is_not_null()) // Access via groups
                     .into_boxed();
@@ -903,6 +959,14 @@ impl Cipher {
                     .filter(ciphers::user_uuid.eq(user_uuid)) // Cipher owner
                     .or_filter(users_organizations::access_all.eq(true)) // access_all in org
                     .or_filter(users_collections::user_uuid.eq(user_uuid)) // Access to collection
+                    .or_filter(
+                        ciphers_collections::collection_uuid.eq_any(
+                            collections::table
+                                .filter(collections::org_uuid.nullable().eq(ciphers::organization_uuid))
+                                .filter(collections::uuid.eq_any(inherited_collection_ids(user_uuid.clone())))
+                                .select(collections::uuid),
+                        ),
+                    )
                     .into_boxed();
 
                 if !visible_only {
@@ -1160,6 +1224,11 @@ impl Cipher {
             ciphers_collections::table
                 .inner_join(collections::table.on(collections::uuid.eq(ciphers_collections::collection_uuid)))
                 .inner_join(
+                    ciphers::table.on(ciphers::uuid
+                        .eq(ciphers_collections::cipher_uuid)
+                        .and(ciphers::organization_uuid.eq(collections::org_uuid.nullable()))),
+                )
+                .inner_join(
                     users_organizations::table.on(users_organizations::org_uuid
                         .eq(collections::org_uuid)
                         .and(users_organizations::user_uuid.eq(user_uuid.clone()))),
@@ -1180,7 +1249,8 @@ impl Cipher {
                         .eq(ciphers_collections::collection_uuid)
                         .and(collections_groups::groups_uuid.eq(groups::uuid))),
                 )
-                .or_filter(users_collections::user_uuid.eq(user_uuid)) // User has access to collection
+                .or_filter(ciphers_collections::collection_uuid.eq_any(inherited_collection_ids(user_uuid.clone())))
+                .or_filter(users_collections::user_uuid.eq(&user_uuid)) // User has access to collection
                 .or_filter(users_organizations::access_all.eq(true)) // User has access all
                 .or_filter(users_organizations::atype.eq_any(ORG_ADMIN_ATYPES)) // User is admin or owner
                 .or_filter(groups::access_all.eq(true)) //Access via group
@@ -1212,3 +1282,6 @@ impl Cipher {
     UuidFromParam,
 )]
 pub struct CipherId(String);
+
+#[cfg(all(test, sqlite))]
+mod inherited_access_tests;

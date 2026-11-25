@@ -98,6 +98,19 @@ For Chinese usage instructions and permission cautions, see
   editable collections can be targeted; changing the query clears the scope
   without discarding staged edits. All changes flow through the existing member
   form and require its final Save; closing the dialog discards unsaved edits.
+- The collection access dialog also has a scoped descendant reader role. Owners
+  and admins can assign a member to any number of collection roots. The server
+  grants view access (including passwords) to their strict descendants at every
+  depth. Direct user, group and single-item grants stay independent. Adding or
+  removing a reader never changes another member's roles.
+- The web vault sends parent collection IDs alongside encrypted names when
+  creating, moving or importing collections. On first assigning a role it
+  supplies the existing branch relationships for legacy collections. The server
+  updates the hierarchy and roles in one transaction, rejects cycles and checks
+  the encrypted catalog revision before accepting changes based on a snapshot.
+  Clients that omit parent information can still read and edit vault items.
+  Collection creates or encrypted renames through those clients require the
+  updated web vault when the organization has active descendant reader roles.
 - Renaming or moving a collection rewrites the path prefix of its descendants,
   retaining every collection ID, external ID, independent access grant and item
   association. Self-nesting, collisions and uneditable descendants reject the

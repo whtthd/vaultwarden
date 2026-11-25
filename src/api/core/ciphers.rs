@@ -2240,6 +2240,7 @@ pub struct CipherSyncData {
     pub cipher_archives: HashMap<CipherId, NaiveDateTime>,
     pub members: HashMap<OrganizationId, Membership>,
     pub user_collections: HashMap<CollectionId, CollectionUser>,
+    pub inherited_collections: HashSet<CollectionId>,
     pub user_collections_groups: HashMap<CollectionId, CollectionGroup>,
     pub user_group_full_access_for_organizations: HashSet<OrganizationId>,
 }
@@ -2342,6 +2343,7 @@ impl CipherSyncData {
             cipher_archives,
             members,
             user_collections,
+            inherited_collections: Collection::inherited_for_user(user_id, conn).await.into_iter().collect(),
             user_collections_groups,
             user_group_full_access_for_organizations,
         }

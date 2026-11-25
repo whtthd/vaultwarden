@@ -1,5 +1,6 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
+const { createHash } = require('node:crypto');
 const enhancements = require('./enhancements.js');
 const { planCollectionUpdate, nestedCollectionTraverse, accessDelta, applyDelta, saveCollection } = enhancements;
 
@@ -87,6 +88,9 @@ test('admin list controls stay on the routed host without redirecting the CDK sc
 function collection(id, name, extra = {}) {
   return { id, name, organizationId: 'org', externalId: 'external-' + id, users: [], groups: [],
     canEdit: () => true, canEditName: () => true, ...extra };
+}
+function snapshot(views) {
+  return enhancements.rememberCollectionSnapshot(views, views.map((v) => ({ ...v, name: 'ciphertext-' + v.id })));
 }
 const access = (id, manage = false) => ({ id, readOnly: !manage, hidePasswords: false, manage });
 
@@ -185,7 +189,7 @@ test('one encrypted batch saves a rename, then updates every local cache entry',
   const child = collection('child', 'A/B');
   const requests = [], cached = [];
   const component = {
-    collection: () => root, organization: () => ({}), allCollections$: [root, child],
+    collection: () => root, organization: () => ({}), allCollections$: snapshot([root, child]),
     collectionAdminService: {
       encrypt: async (model) => ({ name: 'encrypted:' + model.name, externalId: model.externalId, users: model.users, groups: model.groups }),
       apiService: { send: async (...args) => {
@@ -199,6 +203,8 @@ test('one encrypted batch saves a rename, then updates every local cache entry',
   assert.equal(requests.length, 1);
   assert.equal(requests[0][1], '/organizations/org/collections/bulk-update');
   const changes = requests[0][2].collections;
+  assert.equal(requests[0][2].hierarchyRevision, createHash('sha256')
+    .update('child\0ciphertext-child\0root\0ciphertext-root\0').digest('hex'));
   assert.deepEqual(changes.map((c) => c.name), ['encrypted:Z', 'encrypted:Z/B']);
   assert.equal('users' in changes[1], false);
   assert.equal('groups' in changes[1], false);
@@ -209,7 +215,7 @@ test('one encrypted batch saves a rename, then updates every local cache entry',
 test('a failed batch never changes the local cache', async () => {
   const root = collection('root', 'A');
   let writes = 0;
-  const component = { collection: () => root, organization: () => ({}), allCollections$: [root],
+  const component = { collection: () => root, organization: () => ({}), allCollections$: snapshot([root]),
     collectionAdminService: { encrypt: async () => ({}), apiService: { send: async () => { throw new Error('rejected'); } }, updateLocalCollections: async () => writes++ } };
   await assert.rejects(saveCollection(component, { ...root, name: 'B' }, 'user', async (v) => v), /rejected/);
   assert.equal(writes, 0);
@@ -730,25 +736,130 @@ test('subtree moves reject normalized destination collisions', () => {
 });
 
 test('creation rechecks the latest collection list before any create request', async () => {
-  const model = collection(undefined, 'A/B');
+  // CollectionAdminView inherits name from CollectionView, where it is a prototype accessor.
+  class CollectionView {
+    constructor(name) { this._name = name; this.organizationId = 'org'; }
+    get name() { return this._name; }
+  }
+  const model = new CollectionView('A/B');
   let creates = 0;
   const response = { id: 'new-id' };
   const component = { allCollections$: [collection('existing', 'A/B')],
-    collectionAdminService: { create: async (saved, user) => {
-      creates++;
-      assert.equal(saved, model);
-      assert.equal(user, 'test-user');
-      return response;
-    } } };
+    collectionAdminService: {
+      encrypt: async (saved, user, edit) => {
+        assert.equal(saved, model);
+        assert.equal(user, 'test-user');
+        assert.equal(edit, false);
+        return { name: 'encrypted' };
+      },
+      apiService: { postCollection: async (org, request) => {
+        creates++;
+        assert.equal(org, 'org');
+        assert.deepEqual({ ...request, hierarchyRevision: undefined },
+          { name: 'encrypted', parentId: 'root', childIds: ['leaf'], hierarchyRevision: undefined });
+        assert.match(request.hierarchyRevision, /^[a-f0-9]{64}$/);
+        return response;
+      } },
+      updateLocalCollections: async (value, user) => {
+        assert.equal(value, response);
+        assert.equal(user, 'test-user');
+      },
+    } };
   const first = async (v) => v;
   await assert.rejects(enhancements.createCollection(component, model, 'test-user', first), /同名/);
   assert.equal(creates, 0);
-  component.allCollections$ = [];
+  component.allCollections$ = snapshot([collection('root', 'A'), collection('leaf', 'A/B/Missing/Leaf'),
+    collection('lower', 'A/B/Missing/Leaf/C'), collection('sibling', 'A/BB/Sibling'),
+    collection('reserved', 'A/B/Login', { externalId: 'vaultwarden:item-access:login' }),
+    collection('foreign', 'A/B/Foreign', { organizationId: 'other' })]);
   assert.equal(await enhancements.createCollection(component, model, 'test-user', first), response);
+  assert.equal(model.id, response.id);
   assert.equal(creates, 1);
   await assert.rejects(enhancements.createCollection(component, model, 'test-user',
     async () => { throw new Error('cannot load'); }), /cannot load/);
   assert.equal(creates, 1);
+});
+
+test('a scoped role applies member deltas and backfills only its real branch, including older missing path segments', () => {
+  const root = collection('target', 'A/B');
+  const nodes = [collection('parent', 'A'), root, collection('leaf', 'A/B/Missing/C'),
+    collection('display', 'A/B/Missing', { vwStructuralOnly: true }),
+    collection('other', 'A/BB'), collection('foreign', 'A/B/X', { organizationId: 'another' })];
+  const payload = { collections: [{ id: root.id }] };
+  const role = enhancements.readerChanges({ saved: new Set(['keep', 'remove']), selected: new Set(['keep', 'add']) });
+  enhancements.addCollectionRelations(payload, root, root, nodes, [], role, { isAdmin: true });
+  assert.deepEqual(payload, { collections: [{ id: root.id, descendantReaders: { add: ['add'], remove: ['remove'] } }],
+    hierarchy: [{ id: 'target', parentId: 'parent' }, { id: 'leaf', parentId: 'target' }] });
+  assert.throws(() => enhancements.addCollectionRelations({ collections: [{ id: root.id }] },
+    root, root, nodes, [], role, { isAdmin: false }), /仅组织/);
+  const remove = { collections: [{ id: root.id }] };
+  enhancements.addCollectionRelations(remove, root, root, nodes, [], { add: [], remove: ['keep'] }, { isAdmin: true });
+  assert.equal('hierarchy' in remove, false);
+  assert.throws(() => enhancements.addCollectionRelations({ collections: [{ id: root.id }] },
+    root, root, [...nodes, collection('duplicate', 'A')], [], role, { isAdmin: true }), /重名/);
+});
+
+test('moving a subtree maintains renamed edges and adopts existing children beneath its new path', async () => {
+  const org = { isAdmin: true }, top = collection('top', 'Z'), root = collection('root', 'A'),
+    child = collection('child', 'A/B'), adopted = collection('adopted', 'Z/Moved/X');
+  const collections = [root, child, top, adopted, collection('deep', 'Z/Moved/X/Y'), collection('unrelated', 'Z/K')];
+  const edited = { ...root, name: 'Z/Moved' };
+  const changes = planCollectionUpdate(root, edited, collections, [], org);
+  const payload = { collections: changes.map(({ model }) => ({ id: model.id })) };
+  enhancements.addCollectionRelations(payload, root, edited, collections, changes, null, org);
+  assert.deepEqual(payload.collections, [{ id: 'root', parentId: 'top' }, { id: 'child', parentId: 'root' },
+    { id: 'adopted', parentId: 'root' }]);
+  const component = { collection: () => top, organization: () => org, allCollections$: collections,
+    collectionAdminService: { encrypt: async () => ({ name: 'randomized encryption', users: [], groups: [] }),
+      apiService: { send: async (_method, _url, body) => {
+        assert.deepEqual(body, { collections: [{ id: 'top' }] });
+        return { data: [] };
+      } }, updateLocalCollections: async () => {} } };
+  await saveCollection(component, top, 'test-user', async (v) => v);
+});
+
+test('organization import identifies existing and same-batch parents without sending decrypted paths', async () => {
+  const existing = snapshot([collection('old-root', 'Root'), collection('leaf', 'Root/New/Mid/Leaf'),
+    collection('lower', 'Root/New/Mid/Leaf/Lower'), collection('reserved', 'Root/New/Reserved',
+      { externalId: 'vaultwarden:item-access:item-id' })]);
+  const plain = [collection(undefined, 'Root/New/Mid'), collection(undefined, 'Other'),
+    collection('foreign-uuid', 'Root/New'), collection('old-root', 'incorrect-imported-name')];
+  const request = { ciphers: ['encrypted-cipher'], collectionRelationships: [{ key: 0, value: 2 }],
+    collections: plain.map((c) => ({ id: c.id, name: 'ciphertext' })) };
+  let sent = false;
+  const service = { vwOrganizations: { organizations$: () => [{ id: 'org', canViewAllCollections: true }] },
+    vwCollections: { collectionAdminViews$: (org, user) => {
+      assert.equal(org, 'org'); assert.equal(user, 'user'); return existing;
+    } }, accountService: { activeAccount$: { id: 'user' } },
+    importApiService: { postImportOrganizationCiphers: async (org, body) => {
+      assert.equal(org, 'org');
+      assert.deepEqual(body.collections, [
+        { id: undefined, name: 'ciphertext', parentIndex: 2, childIds: ['leaf'] },
+        { id: undefined, name: 'ciphertext', parentId: null },
+        { id: 'foreign-uuid', name: 'ciphertext', parentId: 'old-root' },
+        { id: 'old-root', name: 'ciphertext' },
+      ]);
+      assert.deepEqual(body.collectionRelationships, [{ key: 0, value: 2 }]);
+      assert.equal(body.hierarchyRevision, createHash('sha256')
+        .update('leaf\0ciphertext-leaf\0lower\0ciphertext-lower\0old-root\0ciphertext-old-root\0').digest('hex'));
+      sent = true;
+    } } };
+  await enhancements.importOrganization(service, 'org', 'user', plain, request, async (v) => v);
+  assert.equal(sent, true);
+});
+
+test('restricted imports preserve the original request and a switched account cannot send it', async () => {
+  const requests = [], request = { collections: [{ id: 'target', name: 'encrypted' }] };
+  const service = { vwOrganizations: { organizations$: () => [{ id: 'org', canViewAllCollections: false }] },
+    vwCollections: { collectionAdminViews$: () => { throw Error('Must not query admin collections'); } },
+    accountService: { activeAccount$: { id: 'user' } },
+    importApiService: { postImportOrganizationCiphers: async (_org, payload) => requests.push(payload) } };
+  const args = [service, 'org', 'user', [collection('target', 'Root')], request, async (v) => v];
+  await enhancements.importOrganization(...args);
+  assert.deepEqual(requests, [{ collections: [{ id: 'target', name: 'encrypted' }] }]);
+  service.accountService.activeAccount$ = { id: 'changed' };
+  await assert.rejects(enhancements.importOrganization(...args), /切换/);
+  assert.equal(requests.length, 1);
 });
 
 test('dialog validation reacts to parent, organization and collection changes and cleans up', () => {

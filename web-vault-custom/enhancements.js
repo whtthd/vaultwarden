@@ -11,6 +11,7 @@
 
   const structuralPrefix = "vw-ancestor:";
   const dialogs = new Map();
+  const encryptedSnapshots = new WeakMap();
   const memberSelectors = new Map();
   const scrollHosts = new Set();
   const cipherRows = new Map();
@@ -212,6 +213,52 @@
       return "当前位置已有同名集合，请更换名称或上级集合。";
     }
     return null;
+  }
+
+  function ordinaryCollection(collection) {
+    return !collection.vwStructuralOnly && !collection.externalId?.startsWith("vaultwarden:item-access:");
+  }
+
+  function rememberCollectionSnapshot(views, encrypted) {
+    const sorted = encrypted.filter(ordinaryCollection).sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+    encryptedSnapshots.set(views, sorted.map((c) => `${c.id}\0${c.name}\0`).join(""));
+    return views;
+  }
+
+  async function hierarchyRevision(collections) {
+    // The upstream service returns [] directly when the organization has no collections.
+    const snapshot = collections.length ? encryptedSnapshots.get(collections) : "";
+    if (snapshot === undefined) throw new Error("缺少集合层级快照，请刷新页面再试。");
+    const digest = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(snapshot));
+    return [...new Uint8Array(digest)].map((v) => v.toString(16).padStart(2, "0")).join("");
+  }
+
+  // A path can have structural segments for which no collection exists. Link each real
+  // collection to the nearest real ancestor within the same organization.
+  function collectionHierarchy(collections, organizationId) {
+    const nodes = collections.filter((c) => c.organizationId === organizationId && ordinaryCollection(c));
+    const byPath = new Map();
+    for (const node of nodes) {
+      const matches = byPath.get(node.name) || [];
+      matches.push(node);
+      byPath.set(node.name, matches);
+    }
+    function parentId(node) {
+      let path = node.name;
+      while (path.includes("/")) {
+        path = path.slice(0, path.lastIndexOf("/"));
+        const matches = byPath.get(path);
+        if (matches?.length > 1) throw new Error("上级集合路径重名，无法确认子集合归属。");
+        if (matches) return matches[0].id;
+      }
+      return null;
+    }
+    return { nodes, parentId };
+  }
+
+  function descendantEdges(root, tree) {
+    return tree.nodes.filter((c) => c.id === root.id || isDescendant(c, root))
+      .map((c) => ({ id: c.id, parentId: tree.parentId(c) }));
   }
 
   function planCollectionUpdate(original, edited, collections, selectedIds, organization, revoke = {}) {
@@ -927,7 +974,7 @@
 
   function registerCollectionDialog(component) {
     if (dialogs.has(component)) return;
-    const state = { component, selected: new Set(), collections: undefined,
+    const state = { component, selected: new Set(), collections: undefined, openingSnapshots: new Map(),
       subjects: [], revocations: new Map() };
     dialogs.set(component, state);
     const { name, parent, selectedOrg } = component.formGroup.controls;
@@ -942,23 +989,96 @@
     const pathSubscriptions = [parent, selectedOrg].map((control) =>
       control.valueChanges.subscribe(revalidate));
     const subscription = component.allCollections$.subscribe({
-      next: (collections) => { state.collections = collections; revalidate(); schedule(); },
+      next: (collections) => {
+        state.collections = collections;
+        const orgId = selectedOrg.value;
+        if (orgId && !state.openingSnapshots.has(orgId) && collections.every((c) => c.organizationId === orgId)) {
+          state.openingSnapshots.set(orgId, collections);
+        }
+        revalidate(); schedule();
+      },
       error: () => { state.error = true; schedule(); },
     });
     const subjectSubscription = component.accessItems$?.subscribe({
       next: (subjects) => { state.subjects = subjects; state.refreshRevocations?.(); },
       error: () => { state.subjects = []; state.refreshRevocations?.(); },
     });
+    const membershipSubscription = component.users$?.subscribe({
+      next: (users) => { state.members = users.data; schedule(); },
+    });
     component.destroyRef.onDestroy(() => {
       subscription.unsubscribe();
       subjectSubscription?.unsubscribe();
+      membershipSubscription?.unsubscribe();
       pathSubscriptions.forEach((s) => s.unsubscribe());
       name.removeValidators(validator);
       state.panel?.remove();
+      state.readerPanel?.remove();
       state.note?.remove();
       dialogs.delete(component);
     });
     schedule();
+  }
+
+  function readerChanges(readers) {
+    if (!readers) return null;
+    const add = [...readers.selected].filter((id) => !readers.saved.has(id));
+    const remove = [...readers.saved].filter((id) => !readers.selected.has(id));
+    return add.length || remove.length ? { add, remove } : null;
+  }
+
+  function renderDescendantReaders(state, collection, access) {
+    const component = state.component;
+    if (!component.organization()?.isAdmin || !ordinaryCollection(collection)) return;
+    if (!state.readerPanel?.isConnected) {
+      const panel = element("fieldset", "vw-descendant-access vw-descendant-readers");
+      panel.append(element("legend", "", "子集合只读角色"),
+        element("p", "vw-access-hint", "勾选成员并保存后，成员可以查看现有及以后新增的所有下级集合项目。此集合自身的权限单独设置。"));
+      state.readerList = element("div", "vw-access-tree");
+      state.readerStatus = element("p", "vw-access-hint");
+      state.readerStatus.setAttribute("role", "status");
+      panel.append(state.readerList, state.readerStatus);
+      access.before(panel);
+      state.readerPanel = panel;
+      state.renderedMembers = undefined;
+    }
+    if (!state.readerRequest) {
+      state.readerStatus.textContent = "正在加载角色…";
+      state.readerRequest = component.collectionAdminService.apiService.send("GET",
+        `/organizations/${collection.organizationId}/collections/${collection.id}/descendant-readers`, null, true, true)
+        .then(({ memberIds }) => {
+          if (!Array.isArray(memberIds)) throw new Error("角色数据格式无效。");
+          state.readers = { saved: new Set(memberIds), selected: new Set(memberIds) };
+        }).catch((error) => {
+          state.readerError = error.message || "请重新打开集合后重试。";
+        }).finally(schedule);
+    }
+    if (state.readerError) {
+      const message = "角色加载失败：" + state.readerError;
+      if (state.readerStatus.textContent !== message) state.readerStatus.textContent = message;
+      return;
+    }
+    if (!state.readers || !state.members || state.renderedMembers === state.members) return;
+    const { selected, saved } = state.readers;
+    const rows = [];
+    for (const member of state.members) {
+      if (!saved.has(member.id) && (member.status !== 2 || member.type === 0 || member.type === 1)) continue;
+      const row = element("div", "vw-access-row");
+      const label = element("label");
+      const checkbox = element("input");
+      checkbox.type = "checkbox";
+      checkbox.checked = selected.has(member.id);
+      checkbox.addEventListener("change", () => {
+        if (checkbox.checked) selected.add(member.id);
+        else selected.delete(member.id);
+      });
+      label.append(checkbox, element("span", "", member.name ? `${member.name} (${member.email})` : member.email));
+      row.append(label);
+      rows.push(row);
+    }
+    state.readerList.replaceChildren(...rows);
+    state.readerStatus.textContent = rows.length ? "" : "没有可分配该角色的成员。";
+    state.renderedMembers = state.members;
   }
 
   function renderDialog(state) {
@@ -978,6 +1098,7 @@
       nameInput.closest("bit-form-field").after(state.note);
     }
     const access = host.querySelector("bit-access-selector");
+    if (access) renderDescendantReaders(state, original, access);
     if (!access || state.panel?.isConnected) return;
     if (state.collections && !descendants.length) return;
     const panel = element("fieldset", "vw-descendant-access");
@@ -1128,31 +1249,63 @@
     updateCount();
   }
 
+  function addCollectionRelations(payload, original, edited, collections, updates, changedRole, organization) {
+    if (!changedRole && original.name === edited.name) return;
+    const before = collectionHierarchy(collections, edited.organizationId);
+    if (changedRole) {
+      if (!organization?.isAdmin) throw new Error("仅组织所有者或管理员可分配子集合只读角色。");
+      payload.collections[0].descendantReaders = changedRole;
+      if (changedRole.add.length) payload.hierarchy = descendantEdges(original, before);
+    }
+    if (original.name === edited.name) return;
+    const updated = new Map(updates.map((u) => [u.model.id, u.model]));
+    const after = collectionHierarchy(collections.map((c) => updated.get(c.id) || c), edited.organizationId);
+    const byId = new Map(payload.collections.map((r) => [r.id, r]));
+    const originals = new Map(collections.map((c) => [c.id, c]));
+    for (const { id, parentId } of descendantEdges(edited, after)) {
+      const request = byId.get(id);
+      if (request) request.parentId = parentId;
+      else if (before.parentId(originals.get(id)) !== parentId) payload.collections.push({ id, parentId });
+    }
+  }
+
   async function saveCollection(component, edited, userId, firstValueFrom) {
     const state = dialogs.get(component);
     const selected = [...state?.selected || []];
     const revocations = [...state?.revocations.values() || []];
-    const controls = [...state?.panel?.querySelectorAll("input, button, select") || []];
+    const controls = [state?.panel, state?.readerPanel].flatMap((panel) =>
+      [...panel?.querySelectorAll("input, button, select") || []]);
     const disabled = controls.map((input) => input.disabled);
     if (state) { state.saving = true; state.saveError = undefined; }
     controls.forEach((input) => { input.disabled = true; });
     try {
       const collections = await firstValueFrom(component.allCollections$);
-      const updates = planCollectionUpdate(component.collection(), edited, collections,
-        selected, component.organization(), {
+      const original = component.collection();
+      const organization = component.organization();
+      const updates = planCollectionUpdate(original, edited, collections,
+        selected, organization, {
           users: revocations.filter((r) => r.dimension === "users").map((r) => r.id),
           groups: revocations.filter((r) => r.dimension === "groups").map((r) => r.id),
         });
       const service = component.collectionAdminService;
+      const originals = new Map(collections.map((c) => [c.id, c]));
       const requests = await Promise.all(updates.map(async (update) => {
         const request = await service.encrypt(update.model, userId, true);
+        if (originals.get(update.model.id)?.name === update.model.name) delete request.name;
         if (!update.usersChanged) delete request.users;
         if (!update.groupsChanged) delete request.groups;
         return { ...request, id: update.model.id };
       }));
+      const payload = { collections: requests };
+      const changedRole = readerChanges(state?.readers);
+      addCollectionRelations(payload, original, edited, collections, updates, changedRole, organization);
+      if (changedRole?.add.length || original.name !== edited.name) {
+        payload.hierarchyRevision = await hierarchyRevision(state?.openingSnapshots.get(edited.organizationId) ?? collections);
+      }
       const response = await service.apiService.send("POST",
         `/organizations/${edited.organizationId}/collections/bulk-update`,
-        { collections: requests }, true, true);
+        payload, true, true);
+      if (changedRole) state.readers.saved = new Set(state.readers.selected);
       for (const collection of response.data) {
         await service.updateLocalCollections(collection, userId);
       }
@@ -1173,7 +1326,67 @@
     const collections = await firstValueFrom(component.allCollections$);
     const message = collectionPathError(model, collections);
     if (message) throw new Error(message);
-    return component.collectionAdminService.create(model, userId);
+    const node = { id: Symbol("new collection"), organizationId: model.organizationId, name: model.name };
+    const tree = collectionHierarchy([...collections, node], model.organizationId);
+    const parentId = tree.parentId(node);
+    const childIds = tree.nodes.filter((c) => isDescendant(c, node) && tree.parentId(c) === node.id)
+      .map((c) => c.id);
+    const service = component.collectionAdminService;
+    const request = await service.encrypt(model, userId, false);
+    request.parentId = parentId;
+    request.hierarchyRevision = await hierarchyRevision(dialogs.get(component)?.openingSnapshots.get(model.organizationId) ?? collections);
+    if (childIds.length) request.childIds = childIds;
+    const response = await service.apiService.postCollection(model.organizationId, request);
+    model.id = response.id;
+    await service.updateLocalCollections(response, userId);
+    return response;
+  }
+
+  function setImportParents(plain, encrypted, existing, organizationId) {
+    if (plain.length !== encrypted.length) throw new Error("导入集合与加密请求不匹配。");
+    const current = existing.filter((c) => c.organizationId === organizationId);
+    const currentIds = new Set(current.map((c) => c.id));
+    const added = [];
+    for (const [index, collection] of plain.entries()) {
+      // A foreign export can carry UUIDs. Only IDs already present in this organization are reused.
+      if (!currentIds.has(encrypted[index].id)) added.push({ id: index, name: collection.name, organizationId });
+    }
+    if (!added.length) return false;
+    const tree = collectionHierarchy([...current, ...added], organizationId);
+    for (const collection of added) {
+      const parent = tree.parentId(collection);
+      if (typeof parent === "number") encrypted[collection.id].parentIndex = parent;
+      else encrypted[collection.id].parentId = parent;
+    }
+    const addedPaths = new Set(added.map((c) => c.name));
+    for (const collection of current.filter(ordinaryCollection)) {
+      let path = collection.name;
+      while (path.includes("/")) {
+        path = path.slice(0, path.lastIndexOf("/"));
+        if (!addedPaths.has(path)) continue;
+        const parent = tree.parentId(collection);
+        if (typeof parent === "number") (encrypted[parent].childIds ??= []).push(collection.id);
+        break;
+      }
+    }
+    return true;
+  }
+
+  async function importOrganization(service, orgId, userId, collections, request, firstValueFrom) {
+    if (collections?.length) {
+      const organizations = await firstValueFrom(service.vwOrganizations.organizations$(userId));
+      const org = organizations.find((o) => o.id === orgId);
+      if (!org) throw new Error("当前账号无法访问导入的组织。");
+      if (org.canViewAllCollections) {
+        const existing = await firstValueFrom(service.vwCollections.collectionAdminViews$(orgId, userId));
+        if (setImportParents(collections, request.collections, existing, orgId)) {
+          request.hierarchyRevision = await hierarchyRevision(existing);
+        }
+      }
+      const account = await firstValueFrom(service.accountService.activeAccount$);
+      if (account?.id !== userId) throw new Error("当前账号已切换，请重新导入。");
+    }
+    return service.importApiService.postImportOrganizationCiphers(orgId, request);
   }
 
   function canAssignItemAccess(row) {
@@ -1473,8 +1686,9 @@
   }
 
   return { start, registerScrollHost, unregisterScrollHost, registerCollectionDialog,
-    saveCollection, createCollection, collectionPathError, nestedCollectionTraverse,
+    saveCollection, createCollection, importOrganization, collectionPathError, nestedCollectionTraverse,
     planCollectionUpdate, accessDelta, applyDelta, isDescendant, navigationKey,
+    addCollectionRelations, readerChanges, rememberCollectionSnapshot,
     searchMatchesInput, collectionSearchFilter, searchVaultCiphers, searchVaultCollections,
     searchOrganizationVaultCiphers, vaultQuery, vaultSearchPresentation,
     descendantRows, selectionState, toggleSelection, revocationCandidates,

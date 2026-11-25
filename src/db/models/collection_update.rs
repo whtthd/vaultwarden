@@ -5,14 +5,75 @@ use crate::{
     db::{
         DbConn, DbConnInner,
         schema::{
-            ciphers, ciphers_collections, collections, collections_groups, groups, users, users_collections,
-            users_organizations,
+            ciphers, ciphers_collections, collection_parents, collection_reader_roles, collections, collections_groups,
+            groups, users, users_collections, users_organizations,
         },
     },
     error::MapResult,
 };
 
-use super::{CipherId, Collection, CollectionGroup, CollectionId, CollectionUser, OrganizationId};
+use super::{
+    CipherId, Collection, CollectionGroup, CollectionId, CollectionInheritance, CollectionUser, MembershipId,
+    OrganizationId,
+};
+
+#[derive(Default)]
+pub struct CollectionHierarchyChanges {
+    pub revision: Option<String>,
+    pub parents: Vec<(CollectionId, Option<CollectionId>)>,
+    pub bootstrap: Vec<(CollectionId, Option<CollectionId>)>,
+    pub readers: Vec<(CollectionId, Vec<MembershipId>, Vec<MembershipId>)>,
+    // A legacy client has supplied a new encrypted name without supplying its parent.
+    pub unknown_paths: Vec<CollectionId>,
+}
+
+impl CollectionHierarchyChanges {
+    /// Names are ciphertext. Compare the exact catalog the browser decrypted before accepting
+    /// edges, so a concurrent rename or creation cannot attach an item to a stale branch.
+    fn check_revision(&self, org_id: &OrganizationId, conn: &mut DbConnInner) -> EmptyResult {
+        let Some(revision) = &self.revision else {
+            return Ok(());
+        };
+        let catalog: Vec<(CollectionId, String, Option<String>)> = collections::table
+            .filter(collections::org_uuid.eq(org_id))
+            .select((collections::uuid, collections::name, collections::external_id))
+            .order(collections::uuid)
+            .load(conn)?;
+        let mut bytes = Vec::new();
+        for (id, name, external_id) in catalog {
+            if external_id.as_deref().is_some_and(|id| id.starts_with("vaultwarden:item-access:")) {
+                continue;
+            }
+            bytes.extend_from_slice(id.as_bytes());
+            bytes.push(0);
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.push(0);
+        }
+        if crate::crypto::sha256_hex(&bytes) != *revision {
+            err!("The collection hierarchy changed. Reopen the form and try again.");
+        }
+        Ok(())
+    }
+
+    fn apply(&self, org_id: &OrganizationId, conn: &mut DbConnInner) -> EmptyResult {
+        if !self.unknown_paths.is_empty() {
+            let roles = collection_reader_roles::table.filter(collection_reader_roles::org_uuid.eq(org_id));
+            if diesel::select(diesel::dsl::exists(roles)).get_result::<bool>(conn)? {
+                err!(
+                    "This organization uses descendant reader roles. Use the updated web vault to create, rename or move collections with their parent information."
+                );
+            }
+            diesel::delete(
+                collection_parents::table
+                    .filter(collection_parents::org_uuid.eq(org_id))
+                    .filter(collection_parents::collection_uuid.eq_any(&self.unknown_paths)),
+            )
+            .execute(conn)?;
+        }
+        CollectionInheritance::apply(org_id, &self.parents, &self.bootstrap, &self.readers, conn)
+            .map_res("Invalid collection hierarchy or reader assignment. Refresh the collection and try again.")
+    }
+}
 
 /// One existing collection and its optional access changes. Item associations are never replaced.
 pub struct CollectionUpdate {
@@ -111,9 +172,64 @@ impl CollectionUpdate {
         })
     }
 
-    pub async fn save_all(org_id: OrganizationId, updates: Vec<Self>, conn: &DbConn) -> EmptyResult {
-        conn.run(move |conn| Self::save_transaction(&org_id, &updates, conn).map_res("Error updating collections"))
-            .await
+    /// Serialize collection structure and its grants with the organization row. A stale
+    /// permission form cannot overwrite a concurrent move with an outdated encrypted path.
+    pub async fn save_all(
+        org_id: &OrganizationId,
+        updates: &[Self],
+        previous: Vec<(CollectionId, String, Option<String>)>,
+        hierarchy: CollectionHierarchyChanges,
+        conn: &DbConn,
+    ) -> EmptyResult {
+        conn.run(move |conn| {
+            conn.transaction(|conn| {
+                CollectionInheritance::lock(org_id, conn)?;
+                hierarchy.check_revision(org_id, conn)?;
+                for (id, name, external_id) in previous {
+                    let current = collections::table
+                        .find(&id)
+                        .filter(collections::org_uuid.eq(org_id))
+                        .select((collections::name, collections::external_id))
+                        .first::<(String, Option<String>)>(conn)?;
+                    if current != (name, external_id) {
+                        err!("The collection changed. Refresh it before saving.");
+                    }
+                }
+                hierarchy.apply(org_id, conn)?;
+                Self::save_transaction(org_id, updates, conn).map_res("Error updating collections")
+            })
+        })
+        .await
+    }
+
+    pub async fn create_all(
+        org_id: &OrganizationId,
+        updates: &[Self],
+        hierarchy: CollectionHierarchyChanges,
+        conn: &DbConn,
+    ) -> EmptyResult {
+        conn.run(move |conn| {
+            conn.transaction(|conn| {
+                CollectionInheritance::lock(org_id, conn)?;
+                hierarchy.check_revision(org_id, conn)?;
+                for update in updates {
+                    diesel::insert_into(collections::table).values(&update.collection).execute(conn)?;
+                }
+                hierarchy.apply(org_id, conn)?;
+                Self::save_transaction(org_id, updates, conn).map_res("Error creating collections")
+            })
+        })
+        .await
+    }
+
+    pub(super) fn update_org_revision(org_id: &OrganizationId, conn: &mut DbConnInner) -> QueryResult<()> {
+        let member_users = users_organizations::table
+            .filter(users_organizations::org_uuid.eq(org_id))
+            .select(users_organizations::user_uuid);
+        diesel::update(users::table.filter(users::uuid.eq_any(member_users)))
+            .set(users::updated_at.eq(chrono::Utc::now().naive_utc()))
+            .execute(conn)?;
+        Ok(())
     }
 
     fn save_transaction(org_id: &OrganizationId, updates: &[Self], conn: &mut DbConnInner) -> QueryResult<()> {
@@ -145,7 +261,7 @@ impl CollectionUpdate {
                             .filter(users_organizations::org_uuid.eq(org_id))
                             .filter(users_organizations::user_uuid.eq(&entry.user_uuid))
                             .select(users_organizations::uuid)
-                            .first::<super::MembershipId>(conn)?;
+                            .first::<MembershipId>(conn)?;
                         if entry.collection_uuid != collection.uuid {
                             return Err(diesel::result::Error::NotFound);
                         }
@@ -172,13 +288,7 @@ impl CollectionUpdate {
             }
 
             // Include removed assignees and group members, so their next sync drops revoked access.
-            let member_users = users_organizations::table
-                .filter(users_organizations::org_uuid.eq(org_id))
-                .select(users_organizations::user_uuid);
-            diesel::update(users::table.filter(users::uuid.eq_any(member_users)))
-                .set(users::updated_at.eq(chrono::Utc::now().naive_utc()))
-                .execute(conn)?;
-            Ok(())
+            Self::update_org_revision(org_id, conn)
         })
     }
 }

@@ -329,3 +329,21 @@ fn single_item_rejects_a_collection_bound_to_an_additional_item() {
     assert!(save_item(vec![], &mut conn).is_err());
     assert_eq!(users_collections::table.count().get_result::<i64>(&mut conn).unwrap(), 2);
 }
+
+#[test]
+fn hierarchy_revision_checks_the_ordinary_encrypted_collection_snapshot() {
+    let mut conn = database();
+    conn.batch_execute(
+        "UPDATE collections SET external_id='VAULTWARDEN:item-access:ordinary' WHERE uuid='child';
+        INSERT INTO collections VALUES ('single','org','ciphertext','vaultwarden:item-access:single');",
+    )
+    .unwrap();
+    let org = OrganizationId::from("org".to_owned());
+    let hierarchy = CollectionHierarchyChanges {
+        revision: Some(crate::crypto::sha256_hex(b"child\0encrypted-old-child\0parent\0encrypted-old-parent\0")),
+        ..Default::default()
+    };
+    hierarchy.check_revision(&org, &mut conn).unwrap();
+    conn.batch_execute("UPDATE collections SET name='new encrypted name' WHERE uuid='child';").unwrap();
+    assert!(hierarchy.check_revision(&org, &mut conn).is_err());
+}

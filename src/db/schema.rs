@@ -233,6 +233,29 @@ table! {
 }
 
 table! {
+    collection_parents (collection_uuid) {
+        collection_uuid -> Text,
+        org_uuid -> Text,
+        parent_uuid -> Nullable<Text>,
+    }
+}
+
+table! {
+    collection_reader_roles (collection_uuid, membership_uuid) {
+        collection_uuid -> Text,
+        membership_uuid -> Text,
+        org_uuid -> Text,
+    }
+}
+
+table! {
+    inherited_collection_readers (user_uuid, collection_uuid) {
+        user_uuid -> Text,
+        collection_uuid -> Text,
+    }
+}
+
+table! {
     users_organizations (uuid) {
         uuid -> Text,
         user_uuid -> Text,
@@ -370,6 +393,11 @@ joinable!(ciphers -> users (user_uuid));
 joinable!(ciphers_collections -> ciphers (cipher_uuid));
 joinable!(ciphers_collections -> collections (collection_uuid));
 joinable!(collections -> organizations (org_uuid));
+joinable!(inherited_collection_readers -> collections (collection_uuid));
+joinable!(inherited_collection_readers -> users (user_uuid));
+joinable!(collection_parents -> collections (collection_uuid));
+joinable!(collection_reader_roles -> collections (collection_uuid));
+joinable!(collection_reader_roles -> users_organizations (membership_uuid));
 joinable!(devices -> users (user_uuid));
 joinable!(folders -> users (user_uuid));
 joinable!(folders_ciphers -> ciphers (cipher_uuid));
@@ -400,6 +428,9 @@ allow_tables_to_appear_in_same_query!(
     ciphers,
     ciphers_collections,
     collections,
+    collection_parents,
+    collection_reader_roles,
+    inherited_collection_readers,
     devices,
     folders,
     folders_ciphers,

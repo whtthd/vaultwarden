@@ -1,0 +1,5 @@
+DROP TRIGGER collection_reader_member_deleted;
+DROP TRIGGER collection_reader_collection_deleted;
+DROP VIEW inherited_collection_readers;
+DROP TABLE collection_reader_roles;
+DROP TABLE collection_parents;

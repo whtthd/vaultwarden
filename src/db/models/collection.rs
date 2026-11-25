@@ -8,8 +8,8 @@ use crate::{
     db::{
         DbConn,
         schema::{
-            ciphers_collections, collections, collections_groups, groups, groups_users, users_collections,
-            users_organizations,
+            ciphers_collections, collections, collections_groups, groups, groups_users, inherited_collection_readers,
+            users_collections, users_organizations,
         },
     },
     error::MapResult,
@@ -17,8 +17,8 @@ use crate::{
 use macros::UuidFromParam;
 
 use super::{
-    CipherId, CollectionGroup, GroupUser, Membership, MembershipId, MembershipStatus, MembershipType, OrganizationId,
-    User, UserId, organization::ORG_ADMIN_ATYPES,
+    CipherId, GroupUser, Membership, MembershipId, MembershipStatus, MembershipType, OrganizationId, User, UserId,
+    organization::ORG_ADMIN_ATYPES,
 };
 
 // See (v2026.7.0): https://github.com/bitwarden/server/blob/5d4461aa42cadbacfef8fe2166c5453a5c52773a/src/Core/AdminConsole/Entities/Collection.cs
@@ -50,6 +50,13 @@ pub struct CollectionUser {
 pub struct CollectionCipher {
     pub cipher_uuid: CipherId,
     pub collection_uuid: CollectionId,
+}
+
+#[diesel::dsl::auto_type]
+pub(super) fn inherited_collection_ids(user_id: UserId) -> _ {
+    inherited_collection_readers::table
+        .filter(inherited_collection_readers::user_uuid.eq(user_id))
+        .select(inherited_collection_readers::collection_uuid)
 }
 
 /// Local methods
@@ -136,6 +143,10 @@ impl Collection {
                             cg.hide_passwords,
                             is_manager && (cg.manage || (!cg.read_only && !cg.hide_passwords)),
                         )
+                    } else if cipher_sync_data.inherited_collections.contains(&self.uuid)
+                        && !cipher_sync_data.user_group_full_access_for_organizations.contains(&self.org_uuid)
+                    {
+                        (true, false, false)
                     } else {
                         (false, false, false)
                     }
@@ -161,9 +172,33 @@ impl Collection {
         let mut json_object = self.to_json();
         json_object["object"] = json!("collectionDetails");
         json_object["readOnly"] = json!(read_only);
-        json_object["hidePasswords"] = json!(hide_passwords);
+        let show_inherited_password = hide_passwords
+            && match cipher_sync_data {
+                Some(data) => data.inherited_collections.contains(&self.uuid),
+                None => Self::has_inherited_read(&self.uuid, user_uuid, conn).await,
+            };
+        json_object["hidePasswords"] = json!(hide_passwords && !show_inherited_password);
         json_object["manage"] = json!(manage);
         json_object
+    }
+
+    pub async fn inherited_for_user(user_id: &UserId, conn: &DbConn) -> Vec<CollectionId> {
+        conn.run(move |conn| {
+            inherited_collection_ids(user_id.clone()).load(conn).expect("Error loading inherited collections")
+        })
+        .await
+    }
+
+    async fn has_inherited_read(collection_id: &CollectionId, user_id: &UserId, conn: &DbConn) -> bool {
+        conn.run(move |conn| {
+            diesel::select(diesel::dsl::exists(
+                inherited_collection_ids(user_id.clone())
+                    .filter(inherited_collection_readers::collection_uuid.eq(collection_id)),
+            ))
+            .get_result(conn)
+            .expect("Error checking inherited collection access")
+        })
+        .await
     }
 
     pub async fn can_access_collection(member: &Membership, col_id: &CollectionId, conn: &DbConn) -> bool {
@@ -204,15 +239,20 @@ impl Collection {
     }
 
     pub async fn delete(self, conn: &DbConn) -> EmptyResult {
-        self.update_users_revision(conn).await;
-        CollectionCipher::delete_all_by_collection(&self.uuid, conn).await?;
-        CollectionUser::delete_all_by_collection(&self.uuid, conn).await?;
-        CollectionGroup::delete_all_by_collection(&self.uuid, &self.org_uuid, conn).await?;
-
         conn.run(move |conn| {
-            diesel::delete(collections::table.filter(collections::uuid.eq(self.uuid)))
-                .execute(conn)
-                .map_res("Error deleting collection")
+            conn.transaction(|conn| {
+                super::CollectionInheritance::lock(&self.org_uuid, conn)?;
+                super::CollectionInheritance::prepare_delete(&self.org_uuid, &self.uuid, conn)?;
+                diesel::delete(ciphers_collections::table.filter(ciphers_collections::collection_uuid.eq(&self.uuid)))
+                    .execute(conn)?;
+                diesel::delete(users_collections::table.filter(users_collections::collection_uuid.eq(&self.uuid)))
+                    .execute(conn)?;
+                diesel::delete(collections_groups::table.filter(collections_groups::collections_uuid.eq(&self.uuid)))
+                    .execute(conn)?;
+                diesel::delete(collections::table.filter(collections::uuid.eq(self.uuid))).execute(conn)?;
+                super::CollectionUpdate::update_org_revision(&self.org_uuid, conn)
+            })
+            .map_res("Error deleting collection")
         })
         .await
     }
@@ -264,7 +304,8 @@ impl Collection {
                     .filter(users_organizations::status.eq(MembershipStatus::Confirmed as i32))
                     .filter(
                         users_collections::user_uuid
-                            .eq(user_uuid)
+                            .eq(user_uuid.clone())
+                            .or(collections::uuid.eq_any(inherited_collection_ids(user_uuid)))
                             .or(
                                 // Directly accessed collection
                                 users_organizations::access_all.eq(true), // access_all in Organization
@@ -299,10 +340,15 @@ impl Collection {
                             .and(users_organizations::user_uuid.eq(user_uuid.clone()))),
                     )
                     .filter(users_organizations::status.eq(MembershipStatus::Confirmed as i32))
-                    .filter(users_collections::user_uuid.eq(user_uuid).or(
-                        // Directly accessed collection
-                        users_organizations::access_all.eq(true), // access_all in Organization
-                    ))
+                    .filter(
+                        users_collections::user_uuid
+                            .eq(user_uuid.clone())
+                            .or(collections::uuid.eq_any(inherited_collection_ids(user_uuid)))
+                            .or(
+                                // Directly accessed collection
+                                users_organizations::access_all.eq(true), // access_all in Organization
+                            ),
+                    )
                     .select(collections::all_columns)
                     .distinct()
                     .load::<Self>(conn)
@@ -365,7 +411,7 @@ impl Collection {
                     .left_join(
                         users_organizations::table.on(collections::org_uuid
                             .eq(users_organizations::org_uuid)
-                            .and(users_organizations::user_uuid.eq(user_uuid))),
+                            .and(users_organizations::user_uuid.eq(user_uuid.clone()))),
                     )
                     .left_join(
                         groups_users::table.on(groups_users::users_organizations_uuid.eq(users_organizations::uuid)),
@@ -385,6 +431,7 @@ impl Collection {
                     .filter(
                         users_collections::collection_uuid
                             .eq(uuid)
+                            .or(collections::uuid.eq_any(inherited_collection_ids(user_uuid.clone())))
                             .or(
                                 // Directly accessed collection
                                 users_organizations::access_all.eq(true).or(
@@ -418,17 +465,22 @@ impl Collection {
                     .left_join(
                         users_organizations::table.on(collections::org_uuid
                             .eq(users_organizations::org_uuid)
-                            .and(users_organizations::user_uuid.eq(user_uuid))),
+                            .and(users_organizations::user_uuid.eq(user_uuid.clone()))),
                     )
                     .filter(collections::uuid.eq(uuid))
                     .filter(users_organizations::status.eq(MembershipStatus::Confirmed as i32))
-                    .filter(users_collections::collection_uuid.eq(uuid).or(
-                        // Directly accessed collection
-                        users_organizations::access_all.eq(true).or(
-                            // access_all in Organization
-                            users_organizations::atype.eq_any(ORG_ADMIN_ATYPES), // Org admin or owner
-                        ),
-                    ))
+                    .filter(
+                        users_collections::collection_uuid
+                            .eq(uuid)
+                            .or(collections::uuid.eq_any(inherited_collection_ids(user_uuid.clone())))
+                            .or(
+                                // Directly accessed collection
+                                users_organizations::access_all.eq(true).or(
+                                    // access_all in Organization
+                                    users_organizations::atype.eq_any(ORG_ADMIN_ATYPES), // Org admin or owner
+                                ),
+                            ),
+                    )
                     .select(collections::all_columns)
                     .first::<Self>(conn)
                     .ok()
@@ -898,6 +950,7 @@ impl CollectionUser {
 
     pub async fn has_access_to_collection_by_user(col_id: &CollectionId, user_uuid: &UserId, conn: &DbConn) -> bool {
         Self::find_by_collection_and_user(col_id, user_uuid, conn).await.is_some()
+            || Collection::has_inherited_read(col_id, user_uuid, conn).await
     }
 }
 
@@ -957,15 +1010,6 @@ impl CollectionCipher {
             diesel::delete(ciphers_collections::table.filter(ciphers_collections::cipher_uuid.eq(cipher_uuid)))
                 .execute(conn)
                 .map_res("Error removing cipher from collections")
-        })
-        .await
-    }
-
-    pub async fn delete_all_by_collection(collection_uuid: &CollectionId, conn: &DbConn) -> EmptyResult {
-        conn.run(move |conn| {
-            diesel::delete(ciphers_collections::table.filter(ciphers_collections::collection_uuid.eq(collection_uuid)))
-                .execute(conn)
-                .map_res("Error removing ciphers from collection")
         })
         .await
     }

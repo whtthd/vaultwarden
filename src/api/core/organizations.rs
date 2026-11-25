@@ -15,11 +15,11 @@ use crate::{
     db::{
         DbConn,
         models::{
-            Cipher, CipherId, Collection, CollectionCipher, CollectionGroup, CollectionId, CollectionUpdate,
-            CollectionUser, CustomPermission, Device, EventType, FillAssistPolicyData, Group, GroupId, GroupUser,
-            Invitation, Membership, MembershipId, MembershipStatus, MembershipType, OrgPolicy, OrgPolicyType,
-            Organization, OrganizationApiKey, OrganizationId, TwoFactor, TwoFactorType, User, UserId,
-            custom_roles_enabled,
+            Cipher, CipherId, Collection, CollectionCipher, CollectionGroup, CollectionHierarchyChanges, CollectionId,
+            CollectionInheritance, CollectionUpdate, CollectionUser, CustomPermission, Device, EventType,
+            FillAssistPolicyData, Group, GroupId, GroupUser, Invitation, Membership, MembershipId, MembershipStatus,
+            MembershipType, OrgPolicy, OrgPolicyType, Organization, OrganizationApiKey, OrganizationId, TwoFactor,
+            TwoFactorType, User, UserId, custom_roles_enabled,
         },
     },
     mail,
@@ -40,6 +40,7 @@ pub fn routes() -> Vec<Route> {
         get_org_collections_details,
         get_org_collection_detail,
         get_collection_users,
+        get_descendant_readers,
         put_organization,
         post_organization_collections,
         post_bulk_access_collections,
@@ -124,10 +125,15 @@ struct OrganizationUpdateData {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct FullCollectionData {
+    hierarchy_revision: Option<String>,
     name: String,
     groups: Vec<CollectionGroupData>,
     users: Vec<CollectionMembershipData>,
     external_id: Option<String>,
+    #[serde(default)]
+    parent_id: Submitted<Option<CollectionId>>,
+    #[serde(default)]
+    child_ids: Vec<CollectionId>,
 }
 
 impl FullCollectionData {
@@ -149,6 +155,35 @@ impl FullCollectionData {
 
         Ok(())
     }
+}
+
+// Missing means the client did not supply hierarchy metadata. Explicit null means a real root.
+#[derive(Default)]
+enum Submitted<T> {
+    #[default]
+    Omitted,
+    Value(T),
+}
+
+impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for Submitted<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        T::deserialize(deserializer).map(Self::Value)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CollectionParentData {
+    id: CollectionId,
+    #[serde(deserialize_with = "serde::Deserialize::deserialize")]
+    parent_id: Option<CollectionId>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DescendantReadersData {
+    add: Vec<MembershipId>,
+    remove: Vec<MembershipId>,
 }
 
 #[derive(Deserialize)]
@@ -174,7 +209,11 @@ struct CollectionMembershipData {
 struct CollectionUpdateData {
     id: CollectionId,
     name: Option<String>,
-    external_id: Option<String>,
+    #[serde(default)]
+    external_id: Submitted<Option<String>>,
+    #[serde(default)]
+    parent_id: Submitted<Option<CollectionId>>,
+    descendant_readers: Option<DescendantReadersData>,
     users: Option<Vec<CollectionMembershipData>>,
     groups: Option<Vec<CollectionGroupData>>,
 }
@@ -182,7 +221,10 @@ struct CollectionUpdateData {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BulkCollectionUpdateData {
+    hierarchy_revision: Option<String>,
     collections: Vec<CollectionUpdateData>,
+    #[serde(default)]
+    hierarchy: Vec<CollectionParentData>,
 }
 
 #[derive(Deserialize)]
@@ -315,6 +357,23 @@ async fn put_item_access(
     item_access_response(&org_id, &cipher_id, &headers.user.uuid, &conn).await
 }
 
+#[get("/organizations/<org_id>/collections/<root>/descendant-readers")]
+async fn get_descendant_readers(
+    org_id: OrganizationId,
+    root: CollectionId,
+    headers: AdminHeaders,
+    conn: DbConn,
+) -> JsonResult {
+    if org_id != headers.org_id {
+        err!("Organization not found");
+    }
+    if Collection::find_by_uuid_and_org(&root, &org_id, &conn).await.is_none_or(|c| c.is_item_access()) {
+        err!("Collection not found");
+    }
+    let member_ids = CollectionInheritance::readers(&org_id, &root, &conn).await?;
+    Ok(Json(json!({ "memberIds": member_ids })))
+}
+
 #[post("/organizations/<org_id>/collections/bulk-update", data = "<data>")]
 async fn post_bulk_update_collections(
     org_id: OrganizationId,
@@ -334,6 +393,26 @@ async fn post_bulk_update_collections(
     if ids.iter().collect::<HashSet<_>>().len() != ids.len() {
         err!("Duplicate collection");
     }
+    let changes_readers = data.collections.iter().any(|c| c.descendant_readers.is_some());
+    if (changes_readers || !data.hierarchy.is_empty()) && headers.membership.atype < MembershipType::Admin {
+        err!("Only organization admins and owners can assign descendant reader roles");
+    }
+    if !data.hierarchy.is_empty()
+        && !data.collections.iter().any(|c| c.descendant_readers.as_ref().is_some_and(|r| !r.add.is_empty()))
+    {
+        err!("Legacy collection paths can only be initialized when assigning a descendant reader");
+    }
+    if data.collections.iter().any(|c| matches!(c.parent_id, Submitted::Value(_)))
+        && !headers.membership.has_full_access()
+    {
+        err!("Managing collection hierarchy requires access to all collections");
+    }
+    let mut hierarchy = CollectionHierarchyChanges {
+        revision: data.hierarchy_revision,
+        bootstrap: data.hierarchy.into_iter().map(|e| (e.id, e.parent_id)).collect(),
+        ..Default::default()
+    };
+    let mut previous = Vec::with_capacity(ids.len());
     let headers = ManagerHeaders::from_loose(headers, &ids, &conn).await?;
     let members = Membership::find_by_org(&org_id, &conn).await;
     let members: HashMap<_, _> = members.iter().map(|m| (&m.uuid, m)).collect();
@@ -347,8 +426,20 @@ async fn post_bulk_update_collections(
         if collection.is_item_access() {
             err!("Use the login's single-item permissions to update this collection");
         }
-        if change.external_id.as_deref().is_some_and(|id| id.starts_with("vaultwarden:item-access:")) {
-            err!("This external identifier is reserved for single-item access");
+        previous.push((collection.uuid.clone(), collection.name.clone(), collection.external_id.clone()));
+        if let Submitted::Value(external_id) = change.external_id {
+            if external_id.as_deref().is_some_and(|id| id.starts_with("vaultwarden:item-access:")) {
+                err!("This external identifier is reserved for single-item access");
+            }
+            collection.set_external_id(external_id);
+        }
+        if let Submitted::Value(parent) = change.parent_id {
+            hierarchy.parents.push((change.id.clone(), parent));
+        } else if change.name.as_ref().is_some_and(|name| *name != collection.name) {
+            hierarchy.unknown_paths.push(change.id.clone());
+        }
+        if let Some(readers) = change.descendant_readers {
+            hierarchy.readers.push((change.id, readers.add, readers.remove));
         }
         if let Some(name) = change.name {
             if name.is_empty() {
@@ -356,7 +447,6 @@ async fn post_bulk_update_collections(
             }
             collection.name = name;
         }
-        collection.set_external_id(change.external_id);
         let users_access = if let Some(users) = change.users {
             let mut seen = HashSet::new();
             let mut access = Vec::with_capacity(users.len());
@@ -409,7 +499,7 @@ async fn post_bulk_update_collections(
             groups: groups_access,
         });
     }
-    CollectionUpdate::save_all(org_id.clone(), updates, &conn).await?;
+    CollectionUpdate::save_all(&org_id, &updates, previous, hierarchy, &conn).await?;
 
     let member = Membership::find_by_user_and_org(&headers.user.uuid, &org_id, &conn).await;
     let mut responses = Vec::with_capacity(ids.len());
@@ -436,13 +526,17 @@ async fn post_bulk_update_collections(
         response["assigned"] = json!(assigned);
         responses.push(response);
     }
-    // Notify removed assignees too, so an open vault drops revoked access.
-    for member in Membership::find_by_org(&org_id, &conn).await {
-        if let Some(user) = User::find_by_uuid(&member.user_uuid, &conn).await {
-            nt.send_user_update(UpdateType::SyncVault, &user, headers.device.push_uuid.as_ref(), &conn).await;
+    notify_org_vaults(&org_id, &headers.device, &nt, &conn).await;
+    Ok(Json(json!({ "object": "list", "data": responses, "continuationToken": null })))
+}
+
+async fn notify_org_vaults(org_id: &OrganizationId, device: &Device, nt: &Notify<'_>, conn: &DbConn) {
+    // Include previously authorized members, so open vaults also drop revoked access.
+    for member in Membership::find_by_org(org_id, conn).await {
+        if let Some(user) = User::find_by_uuid(&member.user_uuid, conn).await {
+            nt.send_user_update(UpdateType::SyncVault, &user, device.push_uuid.as_ref(), conn).await;
         }
     }
-    Ok(Json(json!({ "object": "list", "data": responses, "continuationToken": null })))
 }
 
 #[derive(Deserialize)]
@@ -753,6 +847,7 @@ async fn post_organization_collections(
     headers: ManagerHeadersLoose,
     data: Json<FullCollectionData>,
     conn: DbConn,
+    nt: Notify<'_>,
 ) -> JsonResult {
     if org_id != headers.membership.org_uuid {
         err!("Organization not found", "Organization id's do not match");
@@ -768,8 +863,23 @@ async fn post_organization_collections(
         err!("You don't have permission to create collections")
     }
 
+    if matches!(data.parent_id, Submitted::Omitted) && !data.child_ids.is_empty() {
+        err!("An explicit parent is required when attaching child collections");
+    }
+    let mut hierarchy = CollectionHierarchyChanges {
+        revision: data.hierarchy_revision,
+        ..Default::default()
+    };
     let collection = Collection::new(org_id.clone(), data.name, data.external_id);
-    collection.save(&conn).await?;
+    if let Submitted::Value(parent) = data.parent_id {
+        hierarchy.parents.push((collection.uuid.clone(), parent));
+    } else {
+        hierarchy.unknown_paths.push(collection.uuid.clone());
+    }
+    hierarchy.parents.extend(data.child_ids.into_iter().map(|id| (id, Some(collection.uuid.clone()))));
+    let update = collection_update(collection, data.groups, data.users, &conn).await?;
+    CollectionUpdate::create_all(&org_id, std::slice::from_ref(&update), hierarchy, &conn).await?;
+    let collection = update.collection;
 
     log_event(
         EventType::CollectionCreated,
@@ -782,33 +892,10 @@ async fn post_organization_collections(
     )
     .await;
 
-    for group in data.groups {
-        CollectionGroup::new(collection.uuid.clone(), group.id, group.read_only, group.hide_passwords, group.manage)
-            .save(&org_id, &conn)
-            .await?;
-    }
-
-    for user in data.users {
-        let Some(member) = Membership::find_by_uuid_and_org(&user.id, &org_id, &conn).await else {
-            err!("User is not part of organization")
-        };
-
-        if member.access_all {
-            continue;
-        }
-
-        CollectionUser::save(
-            &member.user_uuid,
-            &collection.uuid,
-            user.read_only,
-            user.hide_passwords,
-            user.manage,
-            &conn,
-        )
-        .await?;
-    }
-
-    Ok(Json(collection.to_json_details(&headers.membership.user_uuid, None, &conn).await))
+    notify_org_vaults(&org_id, &headers.device, &nt, &conn).await;
+    let mut response = collection.to_json_details(&headers.membership.user_uuid, None, &conn).await;
+    response["assigned"] = json!(Collection::can_access_collection(&headers.membership, &collection.uuid, &conn).await);
+    Ok(Json(response))
 }
 
 #[derive(Deserialize)]
@@ -857,8 +944,8 @@ async fn post_bulk_access_collections(
             err!("Collection not found", "The current user isn't a manager for this collection")
         }
 
-        // update collection modification date
-        collection.save(&conn).await?;
+        // Refresh client revisions without rewriting encrypted names in a permission-only operation.
+        collection.update_users_revision(&conn).await;
 
         log_event(
             EventType::CollectionUpdated,
@@ -903,6 +990,7 @@ async fn put_organization_collection_update(
     headers: ManagerHeaders,
     data: Json<FullCollectionData>,
     conn: DbConn,
+    nt: Notify<'_>,
 ) -> JsonResult {
     if org_id != headers.org_id {
         err!("Organization not found", "Organization id's do not match");
@@ -924,13 +1012,30 @@ async fn put_organization_collection_update(
         err!("This external identifier is reserved for single-item access");
     }
 
-    collection.name = data.name;
-    collection.external_id = match data.external_id {
-        Some(external_id) if !external_id.trim().is_empty() => Some(external_id),
-        _ => None,
+    if !data.child_ids.is_empty() {
+        err!("Use a collection hierarchy update to reparent existing collections");
+    }
+    let previous = vec![(col_id.clone(), collection.name.clone(), collection.external_id.clone())];
+    let mut hierarchy = CollectionHierarchyChanges {
+        revision: data.hierarchy_revision,
+        ..Default::default()
     };
-
-    collection.save(&conn).await?;
+    if let Submitted::Value(parent) = data.parent_id {
+        if !Membership::find_confirmed_by_user_and_org(&headers.user.uuid, &org_id, &conn)
+            .await
+            .is_some_and(|m| m.has_full_access())
+        {
+            err!("Managing collection hierarchy requires access to all collections");
+        }
+        hierarchy.parents.push((col_id.clone(), parent));
+    } else if collection.name != data.name {
+        hierarchy.unknown_paths.push(col_id.clone());
+    }
+    collection.name = data.name;
+    collection.set_external_id(data.external_id);
+    let update = collection_update(collection, data.groups, data.users, &conn).await?;
+    CollectionUpdate::save_all(&org_id, std::slice::from_ref(&update), previous, hierarchy, &conn).await?;
+    let collection = update.collection;
 
     log_event(
         EventType::CollectionUpdated,
@@ -943,29 +1048,7 @@ async fn put_organization_collection_update(
     )
     .await;
 
-    CollectionGroup::delete_all_by_collection(&col_id, &org_id, &conn).await?;
-
-    for group in data.groups {
-        CollectionGroup::new(col_id.clone(), group.id, group.read_only, group.hide_passwords, group.manage)
-            .save(&org_id, &conn)
-            .await?;
-    }
-
-    CollectionUser::delete_all_by_collection(&col_id, &conn).await?;
-
-    for user in data.users {
-        let Some(member) = Membership::find_by_uuid_and_org(&user.id, &org_id, &conn).await else {
-            err!("User is not part of organization")
-        };
-
-        if member.access_all {
-            continue;
-        }
-
-        CollectionUser::save(&member.user_uuid, &col_id, user.read_only, user.hide_passwords, user.manage, &conn)
-            .await?;
-    }
-
+    notify_org_vaults(&org_id, &headers.device, &nt, &conn).await;
     Ok(Json(collection.to_json_details(&headers.user.uuid, None, &conn).await))
 }
 
@@ -1000,8 +1083,43 @@ async fn delete_organization_collection(
     col_id: CollectionId,
     headers: ManagerHeaders,
     conn: DbConn,
+    nt: Notify<'_>,
 ) -> EmptyResult {
-    delete_organization_collection_impl(&org_id, &col_id, &headers, &conn).await
+    delete_organization_collection_impl(&org_id, &col_id, &headers, &conn).await?;
+    notify_org_vaults(&org_id, &headers.device, &nt, &conn).await;
+    Ok(())
+}
+
+async fn collection_update(
+    collection: Collection,
+    groups: Vec<CollectionGroupData>,
+    users: Vec<CollectionMembershipData>,
+    conn: &DbConn,
+) -> Result<CollectionUpdate, crate::Error> {
+    let mut grants = Vec::with_capacity(users.len());
+    for user in users {
+        let Some(member) = Membership::find_by_uuid_and_org(&user.id, &collection.org_uuid, conn).await else {
+            err!("User is not part of organization");
+        };
+        if !member.access_all {
+            grants.push(CollectionUser {
+                user_uuid: member.user_uuid,
+                collection_uuid: collection.uuid.clone(),
+                read_only: user.read_only,
+                hide_passwords: user.hide_passwords,
+                manage: user.manage,
+            });
+        }
+    }
+    let groups = groups
+        .into_iter()
+        .map(|g| CollectionGroup::new(collection.uuid.clone(), g.id, g.read_only, g.hide_passwords, g.manage))
+        .collect();
+    Ok(CollectionUpdate {
+        collection,
+        users: Some(grants),
+        groups: Some(groups),
+    })
 }
 
 #[derive(Deserialize, Debug)]
@@ -1016,6 +1134,7 @@ async fn bulk_delete_organization_collections(
     headers: ManagerHeadersLoose,
     data: Json<BulkCollectionIds>,
     conn: DbConn,
+    nt: Notify<'_>,
 ) -> EmptyResult {
     if org_id != headers.membership.org_uuid {
         err!("Organization not found", "Organization id's do not match");
@@ -1029,6 +1148,7 @@ async fn bulk_delete_organization_collections(
     for col_id in collections {
         delete_organization_collection_impl(&org_id, &col_id, &headers, &conn).await?;
     }
+    notify_org_vaults(&org_id, &headers.device, &nt, &conn).await;
     Ok(())
 }
 
@@ -2076,11 +2196,17 @@ struct ImportCollectionData {
     name: String,
     id: Option<CollectionId>,
     external_id: Option<String>,
+    #[serde(default)]
+    parent_id: Submitted<Option<CollectionId>>,
+    parent_index: Option<usize>,
+    #[serde(default)]
+    child_ids: Vec<CollectionId>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ImportData {
+    hierarchy_revision: Option<String>,
     ciphers: Vec<CipherData>,
     collections: Vec<ImportCollectionData>,
     collection_relationships: Vec<RelationsData>,
@@ -2129,32 +2255,52 @@ async fn post_org_import(
             err!("Single-item access collections cannot be imported");
         }
     }
-    let mut collections: Vec<CollectionId> = Vec::with_capacity(data.collections.len());
+    let mut collections = Vec::with_capacity(data.collections.len());
+    let mut new_collections = Vec::new();
+    let mut hierarchy = CollectionHierarchyChanges {
+        revision: data.hierarchy_revision,
+        ..Default::default()
+    };
+    let mut indexed_parents = Vec::new();
     for col in data.collections {
-        let existing = col.id.as_ref().and_then(|col_id| existing_collections.get(col_id));
-        let collection_uuid = if let Some(collection) = existing {
-            // When not an Owner or Admin, check if the member is allowed to write to the collection.
+        if let Some(collection) = col.id.as_ref().and_then(|id| existing_collections.get(id)) {
             if headers.membership.atype < MembershipType::Admin
                 && !collection.is_writable_by_user(&headers.membership.user_uuid, &conn).await
             {
-                err!(Compact, "The current user isn't allowed to manage this collection")
+                err!(Compact, "The current user isn't allowed to manage this collection");
             }
-            collection.uuid.clone()
-        } else {
-            // We do not allow users or managers which can not manage all collections to create new collections
-            // If there is any collection other than an existing import collection, abort the import.
-            if headers.membership.atype <= MembershipType::Manager && !headers.membership.has_full_access() {
-                err!(Compact, "The current user isn't allowed to create new collections")
-            }
-            // A reserved marker copied from an export must not turn an ordinary
-            // imported collection into a single-item collection.
-            let external_id = col.external_id.filter(|id| !id.starts_with("vaultwarden:item-access:"));
-            let new_collection = Collection::new(org_id.clone(), col.name, external_id);
-            new_collection.save(&conn).await?;
-            new_collection.uuid
+            collections.push(collection.uuid.clone());
+            continue;
+        }
+        if !headers.membership.has_full_access() || headers.membership.atype < MembershipType::Manager {
+            err!(Compact, "The current user isn't allowed to create new collections");
+        }
+        let external_id = col.external_id.filter(|id| !id.starts_with("vaultwarden:item-access:"));
+        let collection = Collection::new(org_id.clone(), col.name, external_id);
+        let id = collection.uuid.clone();
+        match (col.parent_id, col.parent_index) {
+            (Submitted::Value(parent), None) => hierarchy.parents.push((id.clone(), parent)),
+            (Submitted::Omitted, Some(index)) => indexed_parents.push((id.clone(), index)),
+            (Submitted::Omitted, None) if col.child_ids.is_empty() => hierarchy.unknown_paths.push(id.clone()),
+            _ => err!(Compact, "Invalid collection parent in import"),
+        }
+        hierarchy.parents.extend(col.child_ids.into_iter().map(|child| (child, Some(id.clone()))));
+        collections.push(id);
+        new_collections.push(CollectionUpdate {
+            collection,
+            users: None,
+            groups: None,
+        });
+    }
+    for (child, index) in indexed_parents {
+        let Some(parent) = collections.get(index) else {
+            err!(Compact, "Invalid collection parent index in import");
         };
-
-        collections.push(collection_uuid);
+        hierarchy.parents.push((child, Some(parent.clone())));
+    }
+    if !new_collections.is_empty() {
+        CollectionUpdate::create_all(&org_id, &new_collections, hierarchy, &conn).await?;
+        notify_org_vaults(&org_id, &headers.device, &nt, &conn).await;
     }
 
     // Read the relations between collections and ciphers

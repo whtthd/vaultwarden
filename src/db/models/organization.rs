@@ -15,8 +15,9 @@ use crate::{
     db::{
         DbConn,
         schema::{
-            ciphers, ciphers_collections, collections_groups, groups, groups_users, org_policies, organization_api_key,
-            organizations, users, users_collections, users_organizations,
+            ciphers, ciphers_collections, collections, collections_groups, groups, groups_users,
+            inherited_collection_readers, org_policies, organization_api_key, organizations, users, users_collections,
+            users_organizations,
         },
     },
     error::MapResult,
@@ -1238,19 +1239,31 @@ impl Membership {
 
     pub async fn find_by_cipher_and_org(cipher_uuid: &CipherId, org_uuid: &OrganizationId, conn: &DbConn) -> Vec<Self> {
         conn.run(move |conn| {
+            let direct_readers = users_collections::table
+                .inner_join(
+                    ciphers_collections::table
+                        .on(ciphers_collections::collection_uuid.eq(users_collections::collection_uuid)),
+                )
+                .filter(ciphers_collections::cipher_uuid.eq(cipher_uuid))
+                .select(users_collections::user_uuid);
+            let inherited_readers = inherited_collection_readers::table
+                .inner_join(
+                    ciphers_collections::table
+                        .on(ciphers_collections::collection_uuid.eq(inherited_collection_readers::collection_uuid)),
+                )
+                .inner_join(collections::table.on(collections::uuid.eq(inherited_collection_readers::collection_uuid)))
+                .filter(collections::org_uuid.eq(org_uuid))
+                .filter(ciphers_collections::cipher_uuid.eq(cipher_uuid))
+                .select(inherited_collection_readers::user_uuid);
             users_organizations::table
                 .filter(users_organizations::org_uuid.eq(org_uuid))
                 .filter(users_organizations::status.eq(MembershipStatus::Confirmed as i32))
-                .left_join(users_collections::table.on(users_collections::user_uuid.eq(users_organizations::user_uuid)))
-                .left_join(
-                    ciphers_collections::table.on(ciphers_collections::collection_uuid
-                        .eq(users_collections::collection_uuid)
-                        .and(ciphers_collections::cipher_uuid.eq(&cipher_uuid))),
+                .filter(
+                    users_organizations::access_all
+                        .eq(true)
+                        .or(users_organizations::user_uuid.eq_any(direct_readers))
+                        .or(users_organizations::user_uuid.eq_any(inherited_readers)),
                 )
-                .filter(users_organizations::access_all.eq(true).or(
-                    // AccessAll..
-                    ciphers_collections::cipher_uuid.eq(&cipher_uuid), // ..or access to collection with cipher
-                ))
                 .select(users_organizations::all_columns)
                 .distinct()
                 .load::<Self>(conn)
@@ -1322,13 +1335,20 @@ impl Membership {
         conn: &DbConn,
     ) -> Vec<Self> {
         conn.run(move |conn| {
+            let direct_readers = users_collections::table
+                .filter(users_collections::collection_uuid.eq(collection_uuid))
+                .select(users_collections::user_uuid);
+            let inherited_readers = inherited_collection_readers::table
+                .filter(inherited_collection_readers::collection_uuid.eq(collection_uuid))
+                .select(inherited_collection_readers::user_uuid);
             users_organizations::table
                 .filter(users_organizations::org_uuid.eq(org_uuid))
-                .left_join(users_collections::table.on(users_collections::user_uuid.eq(users_organizations::user_uuid)))
-                .filter(users_organizations::access_all.eq(true).or(
-                    // AccessAll..
-                    users_collections::collection_uuid.eq(&collection_uuid), // ..or access to collection with cipher
-                ))
+                .filter(
+                    users_organizations::access_all
+                        .eq(true)
+                        .or(users_organizations::user_uuid.eq_any(direct_readers))
+                        .or(users_organizations::user_uuid.eq_any(inherited_readers)),
+                )
                 .select(users_organizations::all_columns)
                 .load::<Self>(conn)
                 .expect("Error loading user organizations")
