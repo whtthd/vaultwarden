@@ -154,7 +154,13 @@ app-vault-items tr[appvaultcollectionrow] > td:nth-child(3) > .tw-flex > [bitbad
 .vw-item-access-status { margin: 0; }
 .vw-item-search { background: transparent; border: 1px solid var(--color-border-strong); border-radius: 0.5rem; color: inherit; padding: 0.55rem 0.75rem; }
 .vw-item-members { display: flex; flex-direction: column; gap: 0.5rem; }
-.vw-item-member { align-items: center; display: grid; gap: 0.75rem; grid-template-columns: minmax(0, 1fr) minmax(10rem, 14rem); padding: 0.45rem 0; }
+.vw-item-member { border-bottom: 1px solid var(--color-border-base); display: grid; gap: 0.5rem; padding: 0.75rem 0; }
+.vw-item-identity { overflow-wrap: anywhere; }
+.vw-item-access-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); margin: 0; }
+.vw-item-access-facts dt { color: var(--color-fg-muted); font-size: 0.875rem; }
+.vw-item-access-facts dd { font-weight: 500; margin: 0; }
+.vw-item-grant-controls { align-items: center; display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; }
+.vw-item-pending { flex-basis: 100%; font-size: 0.875rem; }
 .vw-item-member label { align-items: center; display: flex; gap: 0.5rem; min-width: 0; overflow-wrap: anywhere; }
 .vw-item-member select { background: var(--color-bg-primary); border: 1px solid var(--color-border-strong); border-radius: 0.45rem; color: inherit; min-width: 0; padding: 0.45rem; }
 .vw-item-member[hidden] { display: none; }

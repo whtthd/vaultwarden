@@ -29,6 +29,17 @@ use super::{
     organization::ORG_ADMIN_ATYPES,
 };
 
+mod member_item_access;
+
+type AccessFlags = (bool, bool, bool);
+
+fn combine_access(
+    (left_ro, left_hp, left_manage): AccessFlags,
+    (right_ro, right_hp, right_manage): AccessFlags,
+) -> AccessFlags {
+    (left_ro && right_ro, left_hp && right_hp, left_manage || right_manage)
+}
+
 // An inherited grant can reveal a password, but cannot confer editing or management.
 fn with_inherited_read(existing: Option<(bool, bool, bool)>, inherited: bool) -> Option<(bool, bool, bool)> {
     if inherited {
@@ -674,35 +685,8 @@ impl Cipher {
             }
         };
 
-        if rows.is_empty() {
-            // This cipher isn't in any collections accessible to the user.
-            return None;
-        }
-
-        // A cipher can be in multiple collections with inconsistent access flags.
-        // Also, user permission overrule group permissions
-        // and only user permissions are returned by the code above.
-        //
-        // For example, a cipher could be in one collection where the user has
-        // read-only access, but also in another collection where the user has
-        // read/write access. For a flag to be in effect for a cipher, upstream
-        // requires all collections the cipher is in to have that flag set.
-        // Therefore, we do a boolean AND of all values in each of the `read_only`
-        // and `hide_passwords` columns. This could ideally be done as part of the
-        // query, but Diesel doesn't support a min() or bool_and() function on
-        // booleans and this behavior isn't portable anyway.
-        //
-        // The only exception is for the `manage` flag, that needs a boolean OR!
-        let mut read_only = true;
-        let mut hide_passwords = true;
-        let mut manage = false;
-        for (ro, hp, mn) in &rows {
-            read_only &= ro;
-            hide_passwords &= hp;
-            manage |= mn;
-        }
-
-        Some((read_only, hide_passwords, manage))
+        // Of the applicable grants, any write, password view or manage grant wins.
+        rows.into_iter().reduce(combine_access)
     }
 
     async fn get_user_collections_access_flags(&self, user_uuid: &UserId, conn: &DbConn) -> Vec<(bool, bool, bool)> {

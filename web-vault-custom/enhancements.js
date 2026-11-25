@@ -1443,9 +1443,27 @@
     return (entry.readOnly ? "view" : "edit") + (entry.hidePasswords ? "-hidden" : "");
   }
 
+  const itemModes = {
+    view: "查看项目", "view-hidden": "查看项目，隐藏密码",
+    edit: "编辑项目", "edit-hidden": "编辑项目，隐藏密码",
+  };
+
+  function itemAccessLabels(member, saved, draft) {
+    function label(access, empty) {
+      if (access === null) return empty;
+      if (typeof access?.readOnly !== "boolean" || typeof access?.hidePasswords !== "boolean") return "服务端未提供";
+      return itemModes[itemPermission(access)];
+    }
+    return {
+      collection: label(member.collectionAccess, "无集合授权"),
+      effective: label(member.effectiveAccess, "无访问权限"),
+      pending: saved === draft ? "" : `待保存。已保存的单项授权为“${itemModes[saved] ?? "未单独授权"}”。`,
+    };
+  }
+
   function itemGrants(selections) {
     return [...selections].map(([id, mode]) => {
-      if (!["view", "view-hidden", "edit", "edit-hidden"].includes(mode)) {
+      if (!Object.hasOwn(itemModes, mode)) {
         throw new Error("不支持的单项权限级别。");
       }
       return { id, readOnly: mode.startsWith("view"), hidePasswords: mode.endsWith("-hidden"), manage: false };
@@ -1493,7 +1511,7 @@
     header.append(heading, element("p", "vw-access-hint", row.cipher.name));
     const body = element("div", "vw-item-access-body");
     body.append(element("p", "vw-item-access-notice",
-      "仅为此登录项增加成员权限，不改变原集合归属，也不会开放集合中的其他项目。已有组织、集合或群组权限继续有效；移除这里的授权不能降低其他来源的访问权限。"));
+      "单项授权只用于此登录项。取消单项授权后，成员仍可通过已有集合等来源访问。"));
     const status = element("p", "vw-item-access-status", "正在加载成员和单项权限…");
     status.setAttribute("role", "status");
     body.append(status);
@@ -1521,6 +1539,81 @@
     dialog.showModal();
     const selections = new Map();
     let userId;
+    const searchLabel = element("label", "", "搜索成员");
+    const search = element("input", "vw-item-search");
+    search.type = "search";
+    search.id = "vw-item-member-search";
+    searchLabel.htmlFor = search.id;
+    const list = element("div", "vw-item-members");
+    list.setAttribute("role", "group");
+    list.setAttribute("aria-label", "登录项授权成员");
+    const empty = element("p", "vw-access-hint", "没有可单独授权的成员。");
+    let memberRows = [];
+    function filterMembers() {
+      const query = search.value.trim().toLocaleLowerCase();
+      for (const entry of memberRows) entry.line.hidden = !entry.identity.includes(query);
+    }
+    search.addEventListener("input", filterMembers);
+
+    function renderMembers(response, completed) {
+      const dirty = new Set();
+      selections.clear();
+      for (const grant of response.users) selections.set(grant.id, itemPermission(grant));
+      const members = response.members.filter((m) => !m.fullAccess && m.type !== 0 && m.type !== 1);
+      memberRows = members.map((member) => {
+        const saved = selections.get(member.id);
+        const identity = member.name ? `${member.name} (${member.email})` : member.email;
+        const line = element("div", "vw-item-member");
+        line.append(element("strong", "vw-item-identity", identity + (member.status !== 2 ? "（未确认或已撤销）" : "")));
+        const labels = itemAccessLabels(member, saved, saved);
+        const facts = element("dl", "vw-item-access-facts");
+        for (const [label, value] of [["通过集合", labels.collection], ["当前生效", labels.effective]]) {
+          const pair = element("div");
+          pair.append(element("dt", "", label), element("dd", "", value));
+          facts.append(pair);
+        }
+        const controls = element("div", "vw-item-grant-controls");
+        const label = element("label");
+        const check = element("input");
+        check.type = "checkbox";
+        check.checked = saved !== undefined;
+        check.disabled = completed || (member.status !== 2 && !check.checked);
+        check.setAttribute("aria-label", `${identity} 的单项授权`);
+        label.append(check, element("span", "", "单项授权"));
+        const select = element("select");
+        select.setAttribute("aria-label", `${identity} 的单项权限级别`);
+        for (const [value, title] of [["", "未单独授权"], ...Object.entries(itemModes)]) {
+          const option = element("option", "", title);
+          option.value = value;
+          option.disabled = value === "";
+          select.append(option);
+        }
+        select.value = saved ?? "";
+        select.disabled = completed || !check.checked || member.status !== 2;
+        const pending = element("span", "vw-item-pending");
+        pending.hidden = true;
+        function updateDraft(mode) {
+          if (mode === undefined) selections.delete(member.id);
+          else selections.set(member.id, mode);
+          select.value = mode ?? "";
+          select.disabled = mode === undefined || member.status !== 2;
+          pending.textContent = itemAccessLabels(member, saved, mode).pending;
+          pending.hidden = !pending.textContent;
+          if (mode === saved) dirty.delete(member.id);
+          else dirty.add(member.id);
+          status.textContent = dirty.size ? `有 ${dirty.size} 位成员的单项授权变更待保存。` : `已单独授权 ${selections.size} 人。`;
+        }
+        check.addEventListener("change", () => updateDraft(check.checked ? saved ?? "view" : undefined));
+        select.addEventListener("change", () => updateDraft(select.value));
+        controls.append(label, select, pending);
+        line.append(facts, controls);
+        return { line, identity: identity.toLocaleLowerCase() };
+      });
+      list.replaceChildren(...memberRows.map((entry) => entry.line));
+      empty.hidden = members.length > 0;
+      filterMembers();
+    }
+
     try {
       const account = await firstValueFrom(row.accountService.activeAccount$);
       if (!account) throw new Error("请先登录后再分配权限。");
@@ -1528,55 +1621,9 @@
       const response = await row.vwCollectionAdminService.apiService.send("GET",
         `/organizations/${row.cipher.organizationId}/ciphers/${row.cipher.id}/item-access`, null, true, true);
       if (!dialog.isConnected) return;
-      for (const grant of response.users) selections.set(grant.id, itemPermission(grant));
-      const searchLabel = element("label", "", "搜索成员");
-      const search = element("input", "vw-item-search");
-      search.type = "search";
-      search.id = "vw-item-member-search";
-      searchLabel.htmlFor = search.id;
-      const list = element("div", "vw-item-members");
-      list.setAttribute("role", "group");
-      list.setAttribute("aria-label", "登录项授权成员");
-      const memberRows = [];
-      const members = response.members.filter((m) => !m.fullAccess && m.type !== 0 && m.type !== 1);
-      for (const member of members) {
-        const line = element("div", "vw-item-member");
-        const label = element("label");
-        const check = element("input");
-        check.type = "checkbox";
-        check.checked = selections.has(member.id);
-        check.disabled = member.status !== 2 && !check.checked;
-        const identity = member.name ? `${member.name} (${member.email})` : member.email;
-        check.setAttribute("aria-label", `授权给 ${identity}`);
-        label.append(check, element("span", "", identity + (member.status !== 2 ? "（未确认或已撤销）" : "")));
-        const select = element("select");
-        select.setAttribute("aria-label", `${identity} 的单项权限`);
-        for (const [value, title] of [["view", "查看项目"], ["view-hidden", "查看项目，隐藏密码"],
-          ["edit", "编辑项目"], ["edit-hidden", "编辑项目，隐藏密码"]]) {
-          const option = element("option", "", title);
-          option.value = value;
-          select.append(option);
-        }
-        select.value = selections.get(member.id) || "view";
-        select.disabled = !check.checked;
-        check.addEventListener("change", () => {
-          if (check.checked) selections.set(member.id, select.value);
-          else selections.delete(member.id);
-          select.disabled = !check.checked;
-          status.textContent = `单项授权 ${selections.size} 人。组织管理员的既有权限不受此设置影响。`;
-        });
-        select.addEventListener("change", () => selections.set(member.id, select.value));
-        line.append(label, select);
-        list.append(line);
-        memberRows.push({ line, identity: identity.toLocaleLowerCase() });
-      }
-      search.addEventListener("input", () => {
-        const query = search.value.trim().toLocaleLowerCase();
-        for (const entry of memberRows) entry.line.hidden = !entry.identity.includes(query);
-      });
-      body.append(searchLabel, search, list);
-      if (!members.length) body.append(element("p", "", "组织中没有可单独授权的普通成员，请先邀请并确认成员加入。"));
-      status.textContent = `单项授权 ${selections.size} 人。组织管理员的既有权限不受此设置影响。`;
+      renderMembers(response, false);
+      body.append(searchLabel, search, list, empty);
+      status.textContent = `已单独授权 ${selections.size} 人。`;
       save.disabled = false;
     } catch (error) {
       if (dialog.isConnected) {
@@ -1596,6 +1643,8 @@
       try {
         const response = await saveItemAccess(row, selections, userId, firstValueFrom);
         if (!dialog.isConnected) return;
+        renderMembers(response, true);
+        search.disabled = false;
         saving = false;
         cancel.disabled = false;
         cancel.textContent = "完成";
@@ -1692,7 +1741,7 @@
     searchMatchesInput, collectionSearchFilter, searchVaultCiphers, searchVaultCollections,
     searchOrganizationVaultCiphers, vaultQuery, vaultSearchPresentation,
     descendantRows, selectionState, toggleSelection, revocationCandidates,
-    cloneSourceWithoutItemAccess, itemGrants, saveItemAccess,
+    cloneSourceWithoutItemAccess, itemGrants, itemAccessLabels, openItemAccess, saveItemAccess,
     memberCollectionRows, planMemberCollectionAccess, applyMemberCollectionAccess,
     registerMemberCollectionSelector, unregisterMemberCollectionSelector,
     registerCipherRow, unregisterCipherRow, canAssignItemAccess };

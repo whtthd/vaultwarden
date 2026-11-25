@@ -1061,6 +1061,29 @@ test('revocation choices include only selected collections and distinguish membe
   assert.deepEqual(enhancements.revocationCandidates([selected, excluded], []), []);
 });
 
+test('single-item access shows server-reported effective and collection permissions separately from direct grants', () => {
+  const edit = { readOnly: false, hidePasswords: false };
+  const member = { collectionAccess: edit, effectiveAccess: edit };
+  assert.deepEqual(enhancements.itemAccessLabels(member, undefined, undefined), {
+    collection: '编辑项目', effective: '编辑项目', pending: '',
+  });
+  assert.deepEqual(enhancements.itemAccessLabels(member, 'view', 'view'), {
+    collection: '编辑项目', effective: '编辑项目', pending: '',
+  });
+  const remove = enhancements.itemAccessLabels(member, 'view', undefined);
+  assert.equal(remove.effective, '编辑项目');
+  assert.match(remove.pending, /待保存.*查看项目/);
+  assert.match(enhancements.itemAccessLabels(member, undefined, 'edit').pending, /待保存.*未单独授权/);
+  assert.deepEqual(enhancements.itemAccessLabels({ collectionAccess: null, effectiveAccess: null }, undefined, 'edit'), {
+    collection: '无集合授权', effective: '无访问权限', pending: '待保存。已保存的单项授权为“未单独授权”。',
+  });
+  assert.deepEqual(enhancements.itemAccessLabels({}, 'edit', 'edit'), {
+    collection: '服务端未提供', effective: '服务端未提供', pending: '',
+  });
+  assert.equal(enhancements.itemAccessLabels({ collectionAccess: edit, effectiveAccess: { readOnly: true, hidePasswords: true } },
+    'edit', 'edit').effective, '查看项目，隐藏密码');
+});
+
 test('single-item grants allow only supported member permission modes', () => {
   assert.deepEqual(enhancements.itemGrants(new Map([
     ['alpha', 'view'],

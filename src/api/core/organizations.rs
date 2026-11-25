@@ -254,6 +254,7 @@ async fn item_access_response(
     user_id: &UserId,
     conn: &DbConn,
 ) -> JsonResult {
+    let cipher = item_access_cipher(org_id, cipher_id, conn).await?;
     let collection_id = CollectionId::from(cipher_id.to_string());
     let collection = Collection::find_by_uuid(&collection_id, conn).await;
     let mut assignees = Vec::new();
@@ -272,13 +273,17 @@ async fn item_access_response(
     } else {
         Value::Null
     };
-    let mut members = Vec::new();
-    for member in Membership::find_by_org(org_id, conn).await {
+    let memberships = Membership::find_by_org(org_id, conn).await;
+    let access_by_member = cipher.member_item_access(&memberships, conn).await?;
+    let mut members = Vec::with_capacity(memberships.len());
+    for member in memberships {
+        let access = access_by_member.get(&member.uuid);
         let mut detail = member.to_json_mini_details(conn).await;
         detail["fullAccess"] = json!(member.has_full_access());
+        detail["collectionAccess"] = json!(access.and_then(|a| a.collection_access.as_ref()));
+        detail["effectiveAccess"] = json!(access.and_then(|a| a.effective_access.as_ref()));
         members.push(detail);
     }
-    let cipher = item_access_cipher(org_id, cipher_id, conn).await?;
     Ok(Json(json!({ "collection": response, "users": assignees, "members": members,
         "revisionDate": crate::util::format_date(&cipher.updated_at) })))
 }
@@ -293,7 +298,6 @@ async fn get_item_access(
     if org_id != headers.org_id {
         err!("Organization not found");
     }
-    item_access_cipher(&org_id, &cipher_id, &conn).await?;
     item_access_response(&org_id, &cipher_id, &headers.user.uuid, &conn).await
 }
 
