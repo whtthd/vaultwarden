@@ -65,6 +65,46 @@ class PreparationTests(unittest.TestCase):
             b'registerMemberCollectionSelector(this,(0,r.WQX)(w.aKT).nativeElement)', patched)
         self.assertIn(b'ngOnDestroy(){window.VaultwardenEnhancements.unregisterMemberCollectionSelector(this)}', patched)
 
+    @unittest.skipUnless(shutil.which('node'), 'Node.js is needed for compiled collection dialog tests')
+    def test_collection_dialog_footer_routes_and_enables_the_current_tabs_save(self):
+        patched = patch_bundle(self.bundle)
+        tab_group = patched.index(b'N.nVh(7,Fe,')
+        start = patched.rindex(b'template:function(e,t){', 0, tab_group) + len(b'template:')
+        end = patched.index(b',dependencies:', tab_group)
+        script = r"""
+const assert = require('node:assert/strict');
+const vm = require('node:vm');
+const slots = new Map();
+let index;
+const bind = (key, value) => { slots.set(index + ':' + key, value); return bind; };
+const N = {
+  Y8G: bind, R7$: (n = 1) => { index += n; }, vxM() {},
+  bMT: (_pipe, _binding, value) => value,
+  SpI: (_before, text) => slots.set(index + ':text', text),
+};
+const template = vm.runInNewContext('(' + require('node:fs').readFileSync(0, 'utf8') + ')', { N });
+const component = { formGroup: { invalid: true }, editMode: true, dialogReadonly: false,
+  loading: () => false, submit() {}, vwSaveDescendantReaders() {}, showDeleteButton: () => false,
+  buttonDisplayName$: 'Save' };
+function footer(tab, roleDirty) {
+  component.tabIndex = () => tab;
+  component.vwReaderSaveEnabled = () => roleDirty;
+  slots.clear();
+  index = 0;
+  template(2, component);
+  return [slots.get('0:bitSubmit'), slots.get('9:disabled'), slots.get('10:text')];
+}
+for (const tab of [0, 1]) {
+  assert.deepEqual(footer(tab, false), [component.submit, false, 'Save']);
+  assert.deepEqual(footer(tab, true), [component.submit, false, 'Save']);
+}
+assert.deepEqual(footer(2, false), [component.vwSaveDescendantReaders, true, '保存角色']);
+assert.deepEqual(footer(2, true), [component.vwSaveDescendantReaders, false, '保存角色']);
+"""
+        result = subprocess.run(['node', '-e', script], input=patched[start:end].decode(),
+                                text=True, capture_output=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+
     def test_admin_collection_chunk_hook_is_pinned_and_rewrites_runtime_filename(self):
         asset, spec = next(iter(ORIGINAL_LAZY_ASSETS.items()))
         original = (ROOT / 'web-vault' / asset).read_bytes()

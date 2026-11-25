@@ -780,23 +780,203 @@ test('creation rechecks the latest collection list before any create request', a
   assert.equal(creates, 1);
 });
 
-test('a scoped role applies member deltas and backfills only its real branch, including older missing path segments', () => {
-  const root = collection('target', 'A/B');
-  const nodes = [collection('parent', 'A'), root, collection('leaf', 'A/B/Missing/C'),
-    collection('display', 'A/B/Missing', { vwStructuralOnly: true }),
-    collection('other', 'A/BB'), collection('foreign', 'A/B/X', { organizationId: 'another' })];
-  const payload = { collections: [{ id: root.id }] };
-  const role = enhancements.readerChanges({ saved: new Set(['keep', 'remove']), selected: new Set(['keep', 'add']) });
-  enhancements.addCollectionRelations(payload, root, root, nodes, [], role, { isAdmin: true });
-  assert.deepEqual(payload, { collections: [{ id: root.id, descendantReaders: { add: ['add'], remove: ['remove'] } }],
-    hierarchy: [{ id: 'target', parentId: 'parent' }, { id: 'leaf', parentId: 'target' }] });
-  assert.throws(() => enhancements.addCollectionRelations({ collections: [{ id: root.id }] },
-    root, root, nodes, [], role, { isAdmin: false }), /仅组织/);
-  const remove = { collections: [{ id: root.id }] };
-  enhancements.addCollectionRelations(remove, root, root, nodes, [], { add: [], remove: ['keep'] }, { isAdmin: true });
-  assert.equal('hierarchy' in remove, false);
-  assert.throws(() => enhancements.addCollectionRelations({ collections: [{ id: root.id }] },
-    root, root, [...nodes, collection('duplicate', 'A')], [], role, { isAdmin: true }), /重名/);
+test('reader member deltas preserve existing assignees', () => {
+  assert.deepEqual(enhancements.readerChanges({ saved: new Set(['keep', 'remove']), selected: new Set(['keep', 'add']) }),
+    { add: ['add'], remove: ['remove'] });
+  assert.equal(enhancements.readerChanges({ saved: new Set(['keep']), selected: new Set(['keep']) }), null);
+});
+
+test('the reader tab is restricted to editable ordinary collections for organization admins', () => {
+  const component = {
+    collection: () => collection('root', 'A'),
+    organization: () => ({ isAdmin: true }),
+    editMode: true, dialogReadonly: false,
+  };
+  assert.equal(enhancements.canEditDescendantReaders(component), true);
+  for (const change of [
+    { organization: () => ({ isAdmin: false }) }, { organization: () => undefined },
+    { collection: () => undefined }, { editMode: false }, { dialogReadonly: true },
+    { collection: () => collection('login', 'A/Login', { externalId: 'vaultwarden:item-access:login' }) },
+    { collection: () => collection('missing', 'A/Missing', { vwStructuralOnly: true }) },
+  ]) {
+    assert.equal(!!enhancements.canEditDescendantReaders({ ...component, ...change }), false);
+  }
+});
+
+function memberDialogFixture() {
+  const vm = require('node:vm'), fs = require('node:fs');
+  const module = { exports: {} };
+  vm.runInNewContext(fs.readFileSync(require.resolve('./enhancements.js'), 'utf8'), {
+    module, crypto: require('node:crypto').webcrypto, TextEncoder,
+  });
+  const runtime = module.exports;
+
+  // The native tab group detaches the inactive panel and recreates its projected content.
+  class Field extends EventTarget {
+    constructor(tag) { super(); this.tag = tag; this.children = []; this.value = ''; }
+    append(...fields) { for (const f of fields) { f.parent = this; this.children.push(f); } }
+    remove() {
+      if (this.parent) this.parent.children = this.parent.children.filter(f => f !== this);
+      this.parent = undefined;
+    }
+    replaceChildren(...fields) { this.children.slice().forEach(f => f.remove()); this.append(...fields); }
+    setAttribute() {}
+    showModal() { this.open = true; }
+    close() { this.open = false; }
+    focus() {}
+    get parentNode() { return this.parent; }
+    get childElementCount() { return this.children.length; }
+    get isConnected() { return this === body || !!this.parent?.isConnected; }
+    querySelectorAll(selector) {
+      const matches = selector.split(', ');
+      return this.children.flatMap(f => [
+        ...(matches.includes(f.tag) || matches.includes('.' + f.className) ? [f] : []),
+        ...f.querySelectorAll(selector),
+      ]);
+    }
+    querySelector(selector) { return this.querySelectorAll(selector)[0] ?? null; }
+  }
+  const body = new Field('body'), host = new Field('app-collection-dialog');
+  body.append(host);
+  const frames = [];
+  let notifyDom;
+  runtime.start({
+    document: { body, documentElement: {}, addEventListener() {}, createElement: tag => new Field(tag),
+      querySelector: () => null, querySelectorAll: selector => selector === 'app-collection-dialog' ? [host] : [] },
+    MutationObserver: class { constructor(cb) { notifyDom = cb; } observe() {} },
+    addEventListener() {}, requestAnimationFrame: cb => frames.push(cb), location: { hash: '' },
+  });
+  const render = async () => {
+    while (frames.length) frames.shift()();
+    await new Promise(resolve => setImmediate(resolve));
+    while (frames.length) frames.shift()();
+  };
+  return { runtime, body, host, Field, notifyDom, render };
+}
+
+test('switching tabs keeps drafts local and each save submits only its own changes', async () => {
+  const { runtime, host, Field, notifyDom, render } = memberDialogFixture();
+  const subscription = { unsubscribe() {} };
+  const feed = value => ({ subscribe(observer) { observer.next(value); return subscription; } });
+  const control = value => ({ value, valueChanges: { subscribe: () => subscription },
+    addValidators() {}, removeValidators() {}, updateValueAndValidity() {} });
+  const root = collection('root', 'A'), models = [root, collection('leaf', 'A/Missing/Leaf'), collection('other', 'Projects')];
+  runtime.rememberCollectionSnapshot(models, models.map(m => ({ ...m, name: 'encrypted-' + m.id })));
+  const fresh = [collection('root', 'Projects/New'), collection('leaf', 'Projects/New/Missing/Leaf'),
+    collection('display', 'Projects/New/Missing', { vwStructuralOnly: true }), models[2], collection('new', 'Projects/New/NewChild')];
+  runtime.rememberCollectionSnapshot(fresh, fresh.map(m => ({ ...m, name: 'fresh-' + m.id })));
+  const writes = [];
+  let selectedTab = 1, enabled = false, rejectRoleSave = false, reads = 0, destroy;
+  const component = {
+    editMode: true, dialogReadonly: false, collection: () => root, organization: () => ({ isAdmin: true }),
+    tabIndex: Object.assign(() => selectedTab, { set: value => { selectedTab = value; } }),
+    vwReaderSaveEnabled: Object.assign(() => enabled, { set: v => { enabled = v; } }),
+    vwSavedCollections: { next: value => assert.equal(value, fresh) },
+    formGroup: { markAsPristine() {}, controls: { name: control('A'), parent: control(''), selectedOrg: control('org') } },
+    allCollections$: feed(models), users$: feed({ data: ['U', 'S', 'Y', 'R', 'A'].map(id => ({ id, email: id, status: 2, type: 2 })) }),
+    destroyRef: { onDestroy(cb) { destroy = cb; } },
+    collectionAdminService: {
+      encrypt: async model => ({ name: 'encrypted', users: model.users, groups: model.groups }),
+      collectionAdminViews$: () => fresh, updateLocalCollections: async () => {},
+      apiService: { send: async (method, url, body) => {
+        if (method === 'GET') {
+          assert.equal(url, '/organizations/org/collections/root/descendant-readers');
+          reads++;
+          return { memberIds: ['R', 'S'] };
+        }
+        assert.equal(method, 'POST');
+        assert.equal(url, '/organizations/org/collections/bulk-update');
+        writes.push(structuredClone(body));
+        if (rejectRoleSave) throw new Error('save unavailable');
+        return { data: [{ id: 'root', assigned: true }] };
+      } },
+    },
+  };
+  runtime.registerCollectionDialog(component);
+  async function selectTab(index) {
+    selectedTab = index;
+    host.replaceChildren();
+    if (index === 2) {
+      const slot = new Field('div');
+      slot.className = 'vw-descendant-reader-content';
+      host.append(slot);
+    }
+    notifyDom();
+    await render();
+  }
+  const readerLabels = () => host.querySelectorAll('label');
+  const readerOrder = () => readerLabels().map(label => label.querySelector('span').textContent);
+  const yCheckbox = () => readerLabels().find(label => label.querySelector('span').textContent === 'Y').querySelector('input');
+  const changeReader = checked => {
+    const box = yCheckbox();
+    box.checked = checked;
+    box.dispatchEvent(new Event('change'));
+  };
+
+  await selectTab(1);
+  assert.equal(reads, 0);
+  await selectTab(2);
+  assert.equal(reads, 1);
+  assert.equal(enabled, false);
+  const originalOrder = ['S', 'R', 'U', 'Y', 'A'];
+  assert.deepEqual(readerOrder(), originalOrder);
+  changeReader(true);
+  assert.deepEqual(readerOrder(), originalOrder);
+  assert.equal(enabled, true);
+  await selectTab(1);
+  assert.equal(writes.length, 0);
+  await selectTab(2);
+  assert.equal(yCheckbox().checked, true);
+  assert.deepEqual(readerOrder(), originalOrder);
+  assert.equal(reads, 1);
+
+  models.push(collection('ambiguous', 'A'));
+  await assert.rejects(component.vwSaveDescendantReaders(), /重名/);
+  models.pop();
+  assert.equal(enabled, true);
+  assert.equal(writes.length, 0);
+
+  const edited = { ...root, name: 'Projects/New', users: [access('direct')] };
+  await selectTab(1);
+  const saved = await runtime.saveCollection(component, edited, 'user', async feed => feed === component.allCollections$ ? models : feed);
+  assert.equal(runtime.keepReaderDraft(component, saved), true);
+  assert.equal(selectedTab, 2);
+  assert.deepEqual(writes, [{ collections: [
+    { id: 'root', name: 'encrypted', parentId: 'other', users: [access('direct')] },
+    { id: 'leaf', name: 'encrypted', parentId: 'root' },
+  ], hierarchyRevision: createHash('sha256').update('leaf\0encrypted-leaf\0other\0encrypted-other\0root\0encrypted-root\0').digest('hex') }]);
+  await selectTab(2);
+  assert.equal(yCheckbox().checked, true);
+  assert.equal(enabled, true);
+  component.formGroup.controls.name.value = 'Unsaved/Name';
+  component.formGroup.invalid = true;
+  rejectRoleSave = true;
+  await assert.rejects(component.vwSaveDescendantReaders(), /save unavailable/);
+  await render();
+  assert.deepEqual(readerOrder(), originalOrder);
+  assert.equal(enabled, true);
+  rejectRoleSave = false;
+  await component.vwSaveDescendantReaders();
+  await render();
+  assert.deepEqual(readerOrder(), ['S', 'Y', 'R', 'U', 'A']);
+  const expected = { collections: [{ id: 'root', descendantReaders: { add: ['Y'], remove: [] } }],
+    hierarchy: [{ id: 'root', parentId: 'other' }, { id: 'leaf', parentId: 'root' }, { id: 'new', parentId: 'root' }],
+    hierarchyRevision: createHash('sha256').update('leaf\0fresh-leaf\0new\0fresh-new\0other\0fresh-other\0root\0fresh-root\0').digest('hex') };
+  assert.deepEqual(writes.slice(1), [expected, expected]);
+  assert.equal(component.formGroup.controls.name.value, 'Unsaved/Name');
+  assert.equal(runtime.keepReaderDraft(component, saved), false);
+  assert.equal(enabled, false);
+  await component.vwSaveDescendantReaders();
+  assert.equal(writes.length, 3);
+  changeReader(false);
+  await component.vwSaveDescendantReaders();
+  await render();
+  assert.deepEqual(readerOrder(), originalOrder);
+  assert.deepEqual(writes[3], { collections: [{ id: 'root', descendantReaders: { add: [], remove: ['Y'] } }] });
+  changeReader(true);
+  destroy();
+  await render();
+  assert.equal(writes.length, 4);
 });
 
 test('moving a subtree maintains renamed edges and adopts existing children beneath its new path', async () => {
@@ -806,7 +986,7 @@ test('moving a subtree maintains renamed edges and adopts existing children bene
   const edited = { ...root, name: 'Z/Moved' };
   const changes = planCollectionUpdate(root, edited, collections, [], org);
   const payload = { collections: changes.map(({ model }) => ({ id: model.id })) };
-  enhancements.addCollectionRelations(payload, root, edited, collections, changes, null, org);
+  enhancements.addCollectionRelations(payload, root, edited, collections, changes);
   assert.deepEqual(payload.collections, [{ id: 'root', parentId: 'top' }, { id: 'child', parentId: 'root' },
     { id: 'adopted', parentId: 'root' }]);
   const component = { collection: () => top, organization: () => org, allCollections$: collections,
@@ -1059,6 +1239,68 @@ test('revocation choices include only selected collections and distinguish membe
   assert.equal(candidates.find((c) => c.key === 'users:same').label, '成员：Member');
   assert.equal(candidates.find((c) => c.key === 'groups:same').label, '群组：Team');
   assert.deepEqual(enhancements.revocationCandidates([selected, excluded], []), []);
+});
+
+test('single-item member rows put saved direct grants first and reorder only after saving', async () => {
+  const { runtime, body, render } = memberDialogFixture();
+  const view = { readOnly: true, hidePasswords: false };
+  const edit = { readOnly: false, hidePasswords: false };
+  const response = grants => ({
+    users: grants,
+    members: ['U', 'S', 'Y', 'R', 'A'].map(id => ({
+      id, email: id, status: 2, type: 2,
+      collectionAccess: id === 'U' ? edit : null,
+      effectiveAccess: grants.find(g => g.id === id) ?? (id === 'U' ? edit : null),
+    })),
+  });
+  const writes = [];
+  const row = {
+    organizations: [{ id: 'org', isAdmin: true }], cipher: { id: 'item', organizationId: 'org', type: 1, name: 'Login' },
+    accountService: { activeAccount$: { id: 'owner' } }, cipherService: { get: async () => null },
+    vwCollectionAdminService: {
+      encrypt: async model => ({ name: 'encrypted', users: model.users }),
+      apiService: { send: async (method, url, request) => {
+        assert.equal(url, '/organizations/org/ciphers/item/item-access');
+        if (method === 'GET') return response(['R', 'S'].map(id => ({ id, ...view })));
+        assert.equal(method, 'PUT');
+        writes.push(request.users.map(g => g.id));
+        return response(request.users);
+      } },
+    },
+  };
+  await runtime.openItemAccess(row, async v => v);
+  const members = () => body.querySelectorAll('.vw-item-member');
+  const identity = member => member.querySelector('strong').textContent;
+  const order = () => members().map(identity);
+  const member = id => members().find(m => identity(m) === id);
+  const originalOrder = ['S', 'R', 'U', 'Y', 'A'];
+  assert.deepEqual(order(), originalOrder);
+  assert.deepEqual(member('U').querySelectorAll('dd').map(cell => cell.textContent), ['编辑项目', '编辑项目']);
+  assert.equal(member('U').querySelector('input').checked, false);
+
+  const search = body.querySelector('.vw-item-search');
+  search.value = 'u';
+  search.dispatchEvent(new Event('input'));
+  assert.deepEqual(members().filter(m => !m.hidden).map(identity), ['U']);
+  search.value = '';
+  search.dispatchEvent(new Event('input'));
+  assert.deepEqual(order(), originalOrder);
+
+  for (const [id, checked] of [['S', false], ['Y', true]]) {
+    const checkbox = member(id).querySelector('input');
+    checkbox.checked = checked;
+    checkbox.dispatchEvent(new Event('change'));
+  }
+  assert.deepEqual(order(), originalOrder);
+  search.value = 's';
+  search.dispatchEvent(new Event('input'));
+  body.querySelector('form').dispatchEvent(new Event('submit', { cancelable: true }));
+  await render();
+  assert.equal(writes.length, 1);
+  assert.deepEqual(Array.from(writes[0]).sort(), ['R', 'Y']);
+  assert.deepEqual(order(), ['Y', 'R', 'U', 'S', 'A']);
+  assert.equal(search.value, 's');
+  assert.deepEqual(members().filter(m => !m.hidden).map(identity), ['S']);
 });
 
 test('single-item access shows server-reported effective and collection permissions separately from direct grants', () => {

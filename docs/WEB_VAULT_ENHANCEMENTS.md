@@ -98,8 +98,9 @@ For Chinese usage instructions and permission cautions, see
   editable collections can be targeted; changing the query clears the scope
   without discarding staged edits. All changes flow through the existing member
   form and require its final Save; closing the dialog discards unsaved edits.
-- The collection access dialog also has a scoped descendant reader role. Owners
-  and admins can assign a member to any number of collection roots. The server
+- Owners and admins can assign a member to any number of collection roots
+  from the **子集合只读角色** tab in the collection editor. It sits alongside
+  **Edit access** and saves role assignments independently of the collection form. The server
   grants view access (including passwords) to their strict descendants at every
   depth. Direct user, group and single-item grants stay independent. Adding or
   removing a reader never changes another member's roles.

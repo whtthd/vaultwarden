@@ -84,7 +84,76 @@ LOCAL_PATCHES = [
         'provide:Ue.G$,useClass:' + LOCAL_ORIGIN + '?Fb:wa.g2,deps:[]',
     ),
 ]
+# A third native bit-tab adds one conditional binding to the collection tab group.
+# Its four existing pure pipes must start one slot later in the Angular view.
+COLLECTION_TAB_BINDINGS = (
+    'N.Y8G("selectedIndex",n.tabIndex()),N.R7$(),N.Y8G("label",N.mNQ(N.i5U(2,16,"collectionInfo","details"))),'
+    'N.R7$(4),N.JRh(N.bMT(6,19,"name")),N.R7$(3),N.vxM(n.showOrgSelector()?8:-1),N.R7$(3),'
+    'N.JRh(N.i5U(12,21,"nestCollectionUnder","nestSharedFolderUnder")),N.R7$(3),'
+    'N.Y8G("value",void 0)("label",N.i5U(15,24,"noCollection","noSharedFolder")),N.R7$(2),'
+    'N.vxM(n.deletedParentName()?16:-1),N.R7$(),N.Dyx(n.nestOptions()),N.R7$(2),'
+    'N.vxM((e=n.externalId())?19:-1,e),N.R7$(),N.Y8G("label",n.accessTabLabel),N.R7$(2),'
+    'N.vxM(n.dialogReadonly?22:-1),N.R7$(),N.vxM(n.dialogReadonly?-1:23),N.R7$(),'
+    'N.vxM(n.formGroup.controls.access.hasError("managePermissionRequired")&&!n.showAddAccessWarning()?24:-1),'
+    'N.R7$(),N.vxM(null!=(t=n.organization())&&t.useGroups?25:-1),N.R7$(),N.vxM(null!=(i=n.organization())&&i.useGroups?-1:26)'
+)
+COLLECTION_TAB_BINDINGS_WITH_READERS = COLLECTION_TAB_BINDINGS
+for old_slot, new_slot in ((24, 25), (21, 22), (19, 20), (16, 17)):
+    COLLECTION_TAB_BINDINGS_WITH_READERS = COLLECTION_TAB_BINDINGS_WITH_READERS.replace(
+        f',{old_slot},"', f',{new_slot},"')
+COLLECTION_TAB_BINDINGS_WITH_READERS += (
+    ',N.R7$(),N.vxM(window.VaultwardenEnhancements.canEditDescendantReaders(n)?27:-1)'
+)
+
 ENHANCEMENT_PATCHES = [
+    (COLLECTION_TAB_BINDINGS, COLLECTION_TAB_BINDINGS_WITH_READERS),
+    (
+        'function Fe(e,t){if(1&e){const e=N.RV6();N.j41(0,"bit-tab-group",12)',
+        'function vwReaderTab(e,t){1&e&&(N.j41(0,"bit-tab",13),N.nrm(1,"div",29),N.k0s()),2&e&&N.Y8G("label","子集合只读角色")}function Fe(e,t){if(1&e){const e=N.RV6();N.j41(0,"bit-tab-group",12)',
+    ),
+    (
+        'N.nVh(26,Re,5,13,"bit-access-selector",22),N.k0s()()}',
+        'N.nVh(26,Re,5,13,"bit-access-selector",22),N.k0s(),N.nVh(27,vwReaderTab,2,1,"bit-tab",13),N.k0s()}',
+    ),
+    (
+        'N.nVh(7,Fe,27,27,"bit-tab-group",4)',
+        'N.nVh(7,Fe,28,28,"bit-tab-group",4)',
+    ),
+    (
+        '["type","warning",3,"title"],[1,"bwi","bwi-error"]],template:function(e,t){1&e&&(N.j41(0,"form",1)',
+        '["type","warning",3,"title"],[1,"bwi","bwi-error"],[1,"vw-descendant-reader-content"]],template:function(e,t){1&e&&(N.j41(0,"form",1)',
+    ),
+    (
+        '44746(e,t,i){"use strict";i.d(t,{G:()=>Pe,j:()=>Ge});var n=i(11217)',
+        '44746(e,t,i){"use strict";i.d(t,{G:()=>Pe,j:()=>Ge});var vwCollectionSubject=i(87806).B,n=i(11217)',
+    ),
+    (
+        'this.organization=(0,s.ot)(this.organization$),this.allCollections$=this.selectedOrgId$.pipe(',
+        'this.organization=(0,s.ot)(this.organization$),this.vwSavedCollections=new vwCollectionSubject(),'
+        'this.vwReaderSaveEnabled=(0,n.vPA)(!1),this.allCollections$=this.selectedOrgId$.pipe(',
+    ),
+    (
+        't=>this.collectionAdminService.collectionAdminViews$(e,t))):(0,h.of)([])),(0,u.t)({refCount:!0,bufferSize:1})),this.collection$=',
+        't=>this.collectionAdminService.collectionAdminViews$(e,t))):(0,h.of)([])),'
+        '(0,l.n)(e=>this.vwSavedCollections.pipe((0,c.Z)(e))),'
+        '(0,u.t)({refCount:!0,bufferSize:1})),this.collection$=',
+    ),
+    (
+        'N.Y8G("formGroup",t.formGroup)("bitSubmit",t.submit),N.R7$(2),N.vxM(t.editMode?2:-1)',
+        'N.Y8G("formGroup",t.formGroup)("bitSubmit",2===t.tabIndex()?t.vwSaveDescendantReaders:t.submit),N.R7$(2),N.vxM(t.editMode?2:-1)',
+    ),
+    (
+        'N.Y8G("disabled",t.loading()||t.dialogReadonly),N.R7$(),N.SpI(" ",N.bMT(12,14,N.bMT(11,12,t.buttonDisplayName$))," ")',
+        'N.Y8G("disabled",t.loading()||t.dialogReadonly||2===t.tabIndex()&&!t.vwReaderSaveEnabled()),N.R7$(),N.SpI(" ",2===t.tabIndex()?"保存角色":N.bMT(12,14,N.bMT(11,12,t.buttonDisplayName$))," ")',
+    ),
+    (
+        'this.i18nService.t(g,c.name)}),this.close(U.R.Saved,h)',
+        'this.i18nService.t(g,c.name)}),window.VaultwardenEnhancements.keepReaderDraft(this,h)||this.close(U.R.Saved,h)',
+    ),
+    (
+        'close(e,t){this.dialogRef.close({action:e,collection:t})}}function xe(e)',
+        'close(e,t){this.dialogRef.close(e===U.R.Canceled&&this.vwSavedResult?this.vwSavedResult:{action:e,collection:t})}}function xe(e)',
+    ),
     (
         'get searchPlaceholder(){var e,t;return this.activeFilter.isFavorites?"searchFavorites":'
         'this.activeFilter.isDeleted?"searchTrash":this.activeFilter.isArchived?"searchArchive":'

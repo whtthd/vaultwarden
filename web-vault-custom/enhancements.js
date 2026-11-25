@@ -977,6 +977,7 @@
     const state = { component, selected: new Set(), collections: undefined, openingSnapshots: new Map(),
       subjects: [], revocations: new Map() };
     dialogs.set(component, state);
+    component.vwSaveDescendantReaders = () => saveDescendantReaders(component);
     const { name, parent, selectedOrg } = component.formGroup.controls;
     const validator = () => {
       const fullName = parent.value ? `${parent.value}/${name.value ?? ""}` : name.value;
@@ -1027,18 +1028,45 @@
     return add.length || remove.length ? { add, remove } : null;
   }
 
-  function renderDescendantReaders(state, collection, access) {
+  function assignedMembersFirst(members, savedGrants) {
+    const assigned = [];
+    const unassigned = [];
+    for (const member of members) {
+      if (savedGrants.has(member.id)) assigned.push(member);
+      else unassigned.push(member);
+    }
+    return assigned.concat(unassigned);
+  }
+
+  function canEditDescendantReaders(component) {
+    const collection = component.collection();
+    return !!(component.editMode && !component.dialogReadonly && component.organization()?.isAdmin &&
+      collection && ordinaryCollection(collection));
+  }
+
+  function updateReaderStatus(state) {
+    const changed = readerChanges(state.readers);
+    state.component.vwReaderSaveEnabled.set(!!changed && !state.saving && !state.savingReaders);
+    const message = state.readerError || state.readerSaveMessage ||
+      (!state.readers || !state.members ? "正在加载角色…" : changed ? "有未保存的角色修改。" :
+        state.readerList?.childElementCount === 0 ? "没有可分配该角色的成员。" : "");
+    if (state.readerStatus && state.readerStatus.textContent !== message) state.readerStatus.textContent = message;
+  }
+
+  function renderDescendantReaders(state, collection, slot) {
     const component = state.component;
-    if (!component.organization()?.isAdmin || !ordinaryCollection(collection)) return;
-    if (!state.readerPanel?.isConnected) {
-      const panel = element("fieldset", "vw-descendant-access vw-descendant-readers");
-      panel.append(element("legend", "", "子集合只读角色"),
-        element("p", "vw-access-hint", "勾选成员并保存后，成员可以查看现有及以后新增的所有下级集合项目。此集合自身的权限单独设置。"));
+    if (!canEditDescendantReaders(component)) return;
+    if (state.readerPanel?.parentNode !== slot) {
+      const panel = element("div", "vw-descendant-readers");
+      panel.append(element("p", "vw-access-hint",
+        "选择可以查看此集合下所有现有及未来子集合的成员，然后点击“保存角色”。"));
       state.readerList = element("div", "vw-access-tree");
+      state.readerList.setAttribute("role", "group");
+      state.readerList.setAttribute("aria-label", "子集合只读角色成员");
       state.readerStatus = element("p", "vw-access-hint");
       state.readerStatus.setAttribute("role", "status");
       panel.append(state.readerList, state.readerStatus);
-      access.before(panel);
+      slot.append(panel);
       state.readerPanel = panel;
       state.renderedMembers = undefined;
     }
@@ -1050,35 +1078,71 @@
           if (!Array.isArray(memberIds)) throw new Error("角色数据格式无效。");
           state.readers = { saved: new Set(memberIds), selected: new Set(memberIds) };
         }).catch((error) => {
-          state.readerError = error.message || "请重新打开集合后重试。";
+          state.readerError = "角色加载失败：" + (error.message || "请重新打开集合后重试。");
         }).finally(schedule);
     }
-    if (state.readerError) {
-      const message = "角色加载失败：" + state.readerError;
-      if (state.readerStatus.textContent !== message) state.readerStatus.textContent = message;
-      return;
-    }
+    updateReaderStatus(state);
     if (!state.readers || !state.members || state.renderedMembers === state.members) return;
     const { selected, saved } = state.readers;
     const rows = [];
-    for (const member of state.members) {
+    for (const member of assignedMembersFirst(state.members, saved)) {
       if (!saved.has(member.id) && (member.status !== 2 || member.type === 0 || member.type === 1)) continue;
       const row = element("div", "vw-access-row");
       const label = element("label");
       const checkbox = element("input");
       checkbox.type = "checkbox";
       checkbox.checked = selected.has(member.id);
+      checkbox.disabled = !!state.savingReaders;
       checkbox.addEventListener("change", () => {
         if (checkbox.checked) selected.add(member.id);
         else selected.delete(member.id);
+        state.readerSaveMessage = "";
+        updateReaderStatus(state);
       });
       label.append(checkbox, element("span", "", member.name ? `${member.name} (${member.email})` : member.email));
       row.append(label);
       rows.push(row);
     }
     state.readerList.replaceChildren(...rows);
-    state.readerStatus.textContent = rows.length ? "" : "没有可分配该角色的成员。";
     state.renderedMembers = state.members;
+    updateReaderStatus(state);
+  }
+
+  async function saveDescendantReaders(component) {
+    const state = dialogs.get(component);
+    if (!canEditDescendantReaders(component)) throw new Error("仅组织所有者或管理员可分配子集合只读角色。");
+    const change = readerChanges(state?.readers);
+    if (!change || state.savingReaders || state.saving) return;
+    state.savingReaders = true;
+    state.readerSaveMessage = "正在保存角色…";
+    state.readerPanel?.querySelectorAll("input").forEach((input) => { input.disabled = true; });
+    updateReaderStatus(state);
+    try {
+      if (change.add.length) await state.refreshSavedCollections?.();
+      const root = component.collection();
+      const collections = state.openingSnapshots.get(root.organizationId) ?? state.collections;
+      const payload = { collections: [{ id: root.id, descendantReaders: change }] };
+      if (change.add.length) {
+        if (!collections) throw new Error("未能加载集合层级，请重新打开集合后重试。");
+        const savedRoot = collections.find((c) => c.id === root.id);
+        if (!savedRoot) throw new Error("找不到该集合，请刷新后重试。");
+        payload.hierarchy = descendantEdges(savedRoot, collectionHierarchy(collections, root.organizationId));
+        payload.hierarchyRevision = await hierarchyRevision(collections);
+      }
+      await component.collectionAdminService.apiService.send("POST",
+        `/organizations/${root.organizationId}/collections/bulk-update`, payload, true, true);
+      state.readers.saved = new Set(state.readers.selected);
+      state.renderedMembers = undefined;
+      state.readerSaveMessage = "角色已保存。";
+      schedule();
+    } catch (error) {
+      state.readerSaveMessage = "角色保存失败：" + (error.message || "请重试。");
+      throw error;
+    } finally {
+      state.savingReaders = false;
+      state.readerPanel?.querySelectorAll("input").forEach((input) => { input.disabled = false; });
+      updateReaderStatus(state);
+    }
   }
 
   function renderDialog(state) {
@@ -1097,8 +1161,9 @@
         "修改名称或上级集合时，将同步保留全部子集合结构和登录项关联。");
       nameInput.closest("bit-form-field").after(state.note);
     }
+    const slot = host.querySelector(".vw-descendant-reader-content");
+    if (slot && component.tabIndex() === 2) renderDescendantReaders(state, original, slot);
     const access = host.querySelector("bit-access-selector");
-    if (access) renderDescendantReaders(state, original, access);
     if (!access || state.panel?.isConnected) return;
     if (state.collections && !descendants.length) return;
     const panel = element("fieldset", "vw-descendant-access");
@@ -1249,15 +1314,9 @@
     updateCount();
   }
 
-  function addCollectionRelations(payload, original, edited, collections, updates, changedRole, organization) {
-    if (!changedRole && original.name === edited.name) return;
-    const before = collectionHierarchy(collections, edited.organizationId);
-    if (changedRole) {
-      if (!organization?.isAdmin) throw new Error("仅组织所有者或管理员可分配子集合只读角色。");
-      payload.collections[0].descendantReaders = changedRole;
-      if (changedRole.add.length) payload.hierarchy = descendantEdges(original, before);
-    }
+  function addCollectionRelations(payload, original, edited, collections, updates) {
     if (original.name === edited.name) return;
+    const before = collectionHierarchy(collections, edited.organizationId);
     const updated = new Map(updates.map((u) => [u.model.id, u.model]));
     const after = collectionHierarchy(collections.map((c) => updated.get(c.id) || c), edited.organizationId);
     const byId = new Map(payload.collections.map((r) => [r.id, r]));
@@ -1269,12 +1328,26 @@
     }
   }
 
+  function keepReaderDraft(component, saved) {
+    const state = dialogs.get(component);
+    if (!readerChanges(state?.readers)) return false;
+    component.vwSavedResult = { action: "saved", collection: saved };
+    component.formGroup.markAsPristine();
+    state.selected.clear();
+    state.revocations.clear();
+    state.panel?.remove();
+    state.panel = undefined;
+    state.refreshRevocations = undefined;
+    component.tabIndex.set(2);
+    return true;
+  }
+
   async function saveCollection(component, edited, userId, firstValueFrom) {
     const state = dialogs.get(component);
+    await state?.refreshSavedCollections?.();
     const selected = [...state?.selected || []];
     const revocations = [...state?.revocations.values() || []];
-    const controls = [state?.panel, state?.readerPanel].flatMap((panel) =>
-      [...panel?.querySelectorAll("input, button, select") || []]);
+    const controls = [...state?.panel?.querySelectorAll("input, button, select") || []];
     const disabled = controls.map((input) => input.disabled);
     if (state) { state.saving = true; state.saveError = undefined; }
     controls.forEach((input) => { input.disabled = true; });
@@ -1297,17 +1370,30 @@
         return { ...request, id: update.model.id };
       }));
       const payload = { collections: requests };
-      const changedRole = readerChanges(state?.readers);
-      addCollectionRelations(payload, original, edited, collections, updates, changedRole, organization);
-      if (changedRole?.add.length || original.name !== edited.name) {
+      addCollectionRelations(payload, original, edited, collections, updates);
+      if (original.name !== edited.name) {
         payload.hierarchyRevision = await hierarchyRevision(state?.openingSnapshots.get(edited.organizationId) ?? collections);
       }
       const response = await service.apiService.send("POST",
         `/organizations/${edited.organizationId}/collections/bulk-update`,
         payload, true, true);
-      if (changedRole) state.readers.saved = new Set(state.readers.selected);
       for (const collection of response.data) {
         await service.updateLocalCollections(collection, userId);
+      }
+      if (readerChanges(state?.readers)) {
+        // The native allCollections$ replays the opening GET. Re-read persisted
+        // names and their encrypted revision before saving more on this dialog.
+        state.refreshSavedCollections = async () => {
+          const fresh = await firstValueFrom(service.collectionAdminViews$(edited.organizationId, userId));
+          state.openingSnapshots.set(edited.organizationId, fresh);
+          component.vwSavedCollections.next(fresh);
+          state.refreshSavedCollections = undefined;
+        };
+        try {
+          await state.refreshSavedCollections();
+        } catch {
+          state.readerSaveMessage = "集合已保存。保存角色时将重新读取集合层级。";
+        }
       }
       const saved = response.data.find((c) => c.id === edited.id);
       // Callers upsert a returned collection again; omit one the user can no longer access.
@@ -1560,7 +1646,7 @@
       selections.clear();
       for (const grant of response.users) selections.set(grant.id, itemPermission(grant));
       const members = response.members.filter((m) => !m.fullAccess && m.type !== 0 && m.type !== 1);
-      memberRows = members.map((member) => {
+      memberRows = assignedMembersFirst(members, selections).map((member) => {
         const saved = selections.get(member.id);
         const identity = member.name ? `${member.name} (${member.email})` : member.email;
         const line = element("div", "vw-item-member");
@@ -1672,7 +1758,6 @@
       renderCipherRows();
       for (const state of memberSelectors.values()) renderMemberCollectionSelector(state);
       for (const state of dialogs.values()) {
-        if (state.panel && !state.collections && !state.error) continue;
         if (state.panel && state.error && !state.collections) {
           const status = state.panel.querySelector("[data-vw-load]");
           const message = "子集合加载失败，请重新打开窗口。";
@@ -1735,6 +1820,7 @@
   }
 
   return { start, registerScrollHost, unregisterScrollHost, registerCollectionDialog,
+    canEditDescendantReaders, saveDescendantReaders, keepReaderDraft,
     saveCollection, createCollection, importOrganization, collectionPathError, nestedCollectionTraverse,
     planCollectionUpdate, accessDelta, applyDelta, isDescendant, navigationKey,
     addCollectionRelations, readerChanges, rememberCollectionSnapshot,
